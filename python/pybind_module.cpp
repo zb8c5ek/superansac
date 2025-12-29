@@ -161,6 +161,7 @@ PYBIND11_MODULE(pysuperansac, m) {
         .value("SimplePinhole", superansac::camera::CameraType::SimplePinhole)
         .export_values();
 
+
     // Expose the AR sampler settings to Python
     py::class_<superansac::ARSamplerSettings>(m, "ARSamplerSettings")
         .def(py::init<>())
@@ -199,7 +200,9 @@ PYBIND11_MODULE(pysuperansac, m) {
         .def_readwrite("final_optimization_settings", &superansac::RANSACSettings::finalOptimizationSettings)
         .def_readwrite("use_sprt", &superansac::RANSACSettings::useSprt)
         .def_readwrite("local_opt_k", &superansac::RANSACSettings::topKForLocalOptimization)
-        .def_readwrite("neighborhood_settings", &superansac::RANSACSettings::neighborhoodSettings);
+        .def_readwrite("neighborhood_settings", &superansac::RANSACSettings::neighborhoodSettings)
+        .def_readwrite("use_multi_model_filtering", &superansac::RANSACSettings::useMultiModelFiltering)
+        .def_readwrite("multi_model_filtering_k", &superansac::RANSACSettings::multiModelFilteringK);
 
     // Expose the function to Python
     m.def(

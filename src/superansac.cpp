@@ -113,9 +113,47 @@ void SupeRansac::run(const DataMatrix &kData_)
             break;
         }
 
-        // Iterate through the models
+        // Pre-filter multiple models using k best inliers (Optimization)
+        std::vector<models::Model> modelsToScore;
+        if (settings.useMultiModelFiltering && currentModels.size() > 1 && inliers.size() >= settings.multiModelFilteringK)
+        {
+            // Use k best inliers to quickly rank models
+            const size_t k = std::min(settings.multiModelFilteringK, inliers.size());
+            std::vector<std::pair<double, size_t>> modelScores; // (avg residual, model index)
+            modelScores.reserve(currentModels.size());
+
+            for (size_t modelIdx = 0; modelIdx < currentModels.size(); ++modelIdx)
+            {
+                const auto &model = currentModels[modelIdx];
+                double sumResidual = 0.0;
+
+                for (size_t i = 0; i < k; ++i)
+                {
+                    const size_t inlierIdx = inliers[i];
+                    sumResidual += estimator->squaredResidual(kData_.row(inlierIdx), model);
+                }
+
+                modelScores.emplace_back(sumResidual / k, modelIdx);
+            }
+
+            // Sort by average residual and keep only best 1-2 models
+            std::sort(modelScores.begin(), modelScores.end());
+            const size_t numToKeep = std::min<size_t>(2, currentModels.size());
+
+            for (size_t i = 0; i < numToKeep; ++i)
+            {
+                modelsToScore.push_back(currentModels[modelScores[i].second]);
+            }
+        }
+        else
+        {
+            // No filtering, score all models
+            modelsToScore = currentModels;
+        }
+
+        // Iterate through the filtered models
         isModelUpdated = false;  // Reset flag for this iteration
-        for (auto &model : currentModels) 
+        for (auto &model : modelsToScore)
         {
             // Check if the model is valid
             if (!estimator->isValidModel(model, // The model parameters
