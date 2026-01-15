@@ -427,11 +427,16 @@ PYBIND11_MODULE(pysuperansac, m) {
             // Convert optional probabilities (None or 1D float64 array) into std::vector<double>.
             std::vector<double> prob_vec = probs_from_optional(probabilities);
 
-            // Release the GIL for the heavy C++ computation.
-            py::gil_scoped_release release;
-
-            // Call the estimator.
-            return estimateAbsolutePose(mat, camera_type, cam_vec, bb_vec, prob_vec, config);
+            // Release the GIL for the heavy C++ computation, with comprehensive error handling.
+            try {
+                py::gil_scoped_release release;
+                // Call the estimator.
+                return estimateAbsolutePose(mat, camera_type, cam_vec, bb_vec, prob_vec, config);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("C++ exception in estimateAbsolutePose: ") + e.what());
+            } catch (...) {
+                throw std::runtime_error("Unknown exception in estimateAbsolutePose");
+            }
         },
         "A function that performs absolute camera pose estimation from 2D-3D point correspondences.",
         py::arg("correspondences"),

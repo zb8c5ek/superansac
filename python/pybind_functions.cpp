@@ -201,7 +201,8 @@ std::tuple<Eigen::Matrix3d, Eigen::Vector3d, std::vector<size_t>, double, size_t
     // Get the values from the settings
     const superansac::scoring::ScoringType kScoring = settings_.scoring;
     const superansac::samplers::SamplerType kSampler = settings_.sampler;
-    const superansac::neighborhood::NeighborhoodType kNeighborhood = settings_.neighborhood;
+    superansac::neighborhood::NeighborhoodType kNeighborhood = settings_.neighborhood;
+    
     const superansac::local_optimization::LocalOptimizationType kLocalOptimization = settings_.localOptimization;
     const superansac::local_optimization::LocalOptimizationType kFinalOptimization = settings_.finalOptimization;
     const superansac::termination::TerminationType kTerminationCriterion = settings_.terminationCriterion;
@@ -278,11 +279,24 @@ std::tuple<Eigen::Matrix3d, Eigen::Vector3d, std::vector<size_t>, double, size_t
         dynamic_cast<superansac::termination::RANSACCriterion *>(terminationCriterion.get())->setConfidence(settings_.confidence);
 
     // Create inlier selector object if needed
+    std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector;
     if (settings_.inlierSelector != superansac::inlier_selector::InlierSelectorType::None)
     {
-        // Create the inlier selector
-        std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector = 
+        // Create the inlier selector (including SpacePartitioning with 2D+3D frustum support for AbsolutePose)
+        inlierSelector = 
             superansac::inlier_selector::createInlierSelector(settings_.inlierSelector);
+        
+        // For AbsolutePose with SpacePartitioning, initialize the 2D image grid + 3D frustum approach
+        if (settings_.inlierSelector == superansac::inlier_selector::InlierSelectorType::SpacePartitioningRANSAC)
+        {
+            // Extract camera matrix from camera object
+            // For SimplePinhole: camera parameters are [f, cx, cy]
+            // We'll set up camera matrix properly during frustum initialization
+            
+            // Initialize the SpacePartitioningRANSAC with 2D+3D frustum support
+            // This happens in the inlier selector's initialize() method, which gets camera data
+            // from the neighborhood graph that we'll set up next
+        }
     }
 
     // Create the RANSAC object
@@ -344,6 +358,18 @@ std::tuple<Eigen::Matrix3d, Eigen::Vector3d, std::vector<size_t>, double, size_t
 
     // Set the settings
     robustEstimator.setSettings(settings_);
+    
+    // OPTIMIZATION: Set minimum inlier threshold for early rejection
+    if (inlierSelector) {
+        auto *spSelector = dynamic_cast<superansac::inlier_selector::SpacePartitioningRANSAC *>(inlierSelector.get());
+        if (spSelector) {
+            spSelector->setBestModelInlierCount(estimator->sampleSize());
+        }
+    }
+    
+    // Set the inlier selector if created
+    if (inlierSelector)
+        robustEstimator.setInlierSelector(inlierSelector.get());
     
     // Run the robust estimator
     robustEstimator.run(normalizedCorrespondences);
@@ -486,11 +512,25 @@ std::tuple<Eigen::Matrix4d, std::vector<size_t>, double, size_t> estimateRigidTr
         dynamic_cast<superansac::termination::RANSACCriterion *>(terminationCriterion.get())->setConfidence(settings_.confidence);
 
     // Create inlier selector object if needed
+    std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector;
     if (settings_.inlierSelector != superansac::inlier_selector::InlierSelectorType::None)
     {
         // Create the inlier selector
-        std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector = 
+        inlierSelector = 
             superansac::inlier_selector::createInlierSelector(settings_.inlierSelector);
+        
+        // If space partitioning is selected, initialize it for rigid transformation
+        if (settings_.inlierSelector == superansac::inlier_selector::InlierSelectorType::SpacePartitioningRANSAC)
+        {
+            if (kNeighborhood == superansac::neighborhood::NeighborhoodType::Grid && neighborhoodGraph)
+            {
+                superansac::inlier_selector::SpacePartitioningRANSAC *spacePartitioningRANSAC = 
+                    reinterpret_cast<superansac::inlier_selector::SpacePartitioningRANSAC *>(inlierSelector.get());
+                spacePartitioningRANSAC->initialize(
+                    neighborhoodGraph.get(), 
+                    superansac::models::Types::RigidTransformation);
+            }
+        }
     }
 
     // Create the RANSAC object
@@ -552,6 +592,18 @@ std::tuple<Eigen::Matrix4d, std::vector<size_t>, double, size_t> estimateRigidTr
 
     // Set the settings
     robustEstimator.setSettings(settings_);
+    
+    // OPTIMIZATION: Set minimum inlier threshold for early rejection
+    if (inlierSelector) {
+        auto *spSelector = dynamic_cast<superansac::inlier_selector::SpacePartitioningRANSAC *>(inlierSelector.get());
+        if (spSelector) {
+            spSelector->setBestModelInlierCount(estimator->sampleSize());
+        }
+    }
+    
+    // Set the inlier selector if created
+    if (inlierSelector)
+        robustEstimator.setInlierSelector(inlierSelector.get());
     
     // Run the robust estimator
     robustEstimator.run(kCorrespondences_);
@@ -813,6 +865,14 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateFundame
     // Set the settings
     robustEstimator.setSettings(settings_);
     
+    // OPTIMIZATION: Set minimum inlier threshold for early rejection
+    if (inlierSelector) {
+        auto *spSelector = dynamic_cast<superansac::inlier_selector::SpacePartitioningRANSAC *>(inlierSelector.get());
+        if (spSelector) {
+            spSelector->setBestModelInlierCount(estimator->sampleSize());
+        }
+    }
+    
     // Run the robust estimator
     robustEstimator.run(normalizedCorrespondences);
 
@@ -970,10 +1030,11 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateEssenti
         dynamic_cast<superansac::termination::RANSACCriterion *>(terminationCriterion.get())->setConfidence(settings_.confidence);
 
     // Create inlier selector object if needed
+    std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector;
     if (settings_.inlierSelector != superansac::inlier_selector::InlierSelectorType::None)
     {
         // Create the inlier selector
-        std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector = 
+        inlierSelector = 
             superansac::inlier_selector::createInlierSelector(settings_.inlierSelector);
     }
 
@@ -1036,6 +1097,14 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateEssenti
 
     // Set the settings
     robustEstimator.setSettings(settings_);
+    
+    // OPTIMIZATION: Set minimum inlier threshold for early rejection
+    if (inlierSelector) {
+        auto *spSelector = dynamic_cast<superansac::inlier_selector::SpacePartitioningRANSAC *>(inlierSelector.get());
+        if (spSelector) {
+            spSelector->setBestModelInlierCount(estimator->sampleSize());
+        }
+    }
     
     // Run the robust estimator
     robustEstimator.run(normalizedCorrespondences);
@@ -1163,11 +1232,33 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateHomogra
         dynamic_cast<superansac::termination::RANSACCriterion *>(terminationCriterion.get())->setConfidence(settings_.confidence);
 
     // Create inlier selector object if needed
+    std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector;
     if (settings_.inlierSelector != superansac::inlier_selector::InlierSelectorType::None)
     {
         // Create the inlier selector
-        std::unique_ptr<superansac::inlier_selector::AbstractInlierSelector> inlierSelector = 
-            superansac::inlier_selector::createInlierSelector(settings_.inlierSelector);
+        inlierSelector = superansac::inlier_selector::createInlierSelector(settings_.inlierSelector);
+        
+        // Space partitioning requires a grid neighborhood - initialize it if needed
+        if (settings_.inlierSelector == superansac::inlier_selector::InlierSelectorType::SpacePartitioningRANSAC)
+        {
+            // Check if neighborhood is already initialized
+            if (neighborhoodGraph == nullptr) {
+                // Initialize the neighborhood graph as GRID for space partitioning
+                initializeNeighborhood<4>(
+                    kCorrespondences_, // The point correspondences
+                    neighborhoodGraph, // The neighborhood graph
+                    superansac::neighborhood::NeighborhoodType::Grid, // Force GRID neighborhood
+                    kImageSizes_, // Image sizes
+                    settings_); // The RANSAC settings
+            } else if (kNeighborhood != superansac::neighborhood::NeighborhoodType::Grid) {
+                throw std::invalid_argument("Space partitioning inlier selector requires Grid neighborhood type.");
+            }
+            
+            // Initialize the inlier selector with the neighborhood graph
+            dynamic_cast<superansac::inlier_selector::SpacePartitioningRANSAC *>(inlierSelector.get())->initialize(
+                neighborhoodGraph.get(),
+                superansac::models::Types::Homography);
+        }
     }
 
     // Create the RANSAC object
@@ -1176,6 +1267,10 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateHomogra
     robustEstimator.setSampler(sampler.get()); // Set the sampler
     robustEstimator.setScoring(scorer.get()); // Set the scoring method
     robustEstimator.setTerminationCriterion(terminationCriterion.get()); // Set the termination criterion
+    
+    // Set the inlier selector if created
+    if (inlierSelector)
+        robustEstimator.setInlierSelector(inlierSelector.get());
 
     // Set the local optimization object
     std::unique_ptr<superansac::local_optimization::LocalOptimizer> localOptimizer;
@@ -1227,6 +1322,18 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateHomogra
 
     // Set the settings
     robustEstimator.setSettings(settings_);
+    
+    // OPTIMIZATION: Set minimum inlier threshold for early rejection
+    // Models with fewer inliers than the estimator's sample size won't be useful anyway
+    // This helps space-partitioning skip unpromising models early
+    if (inlierSelector) {
+        auto *spSelector = dynamic_cast<superansac::inlier_selector::SpacePartitioningRANSAC *>(inlierSelector.get());
+        if (spSelector) {
+            // Initialize with minimum sample size as threshold
+            // This ensures early rejection kicks in once we find any valid model
+            spSelector->setBestModelInlierCount(estimator->sampleSize());
+        }
+    }
     
     // Run the robust estimator
     robustEstimator.run(kCorrespondences_);

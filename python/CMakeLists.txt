@@ -1,5 +1,11 @@
 # Find Pybind11
-find_package(pybind11 REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+if(NOT pybind11_FOUND)
+  execute_process(COMMAND python -m pybind11 --cmake-prefix-path 
+    OUTPUT_VARIABLE pybind11_DIR 
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  find_package(pybind11 CONFIG REQUIRED)
+endif()
 
 # Python extension module
 pybind11_add_module(pysuperansac MODULE

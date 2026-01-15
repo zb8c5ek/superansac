@@ -18,8 +18,20 @@ class CMakeBuild(build_ext):
 
     def build_extension(self, ext):
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
+        
+        # Get pybind11 cmake prefix
+        import pybind11
+        pybind11_prefix = os.path.dirname(pybind11.__file__)
+        
         cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir,
-                      '-DPYTHON_EXECUTABLE=' + sys.executable]
+                      '-DPYTHON_EXECUTABLE=' + sys.executable,
+                      '-Dpybind11_DIR=' + os.path.join(pybind11_prefix, 'share', 'cmake', 'pybind11')]
+        
+        # Explicitly set Python version to match current interpreter
+        import sysconfig
+        python_version = sysconfig.get_python_version()
+        cmake_args.append('-DPython3_VERSION=' + python_version)
+        cmake_args.append('-DPython_EXECUTABLE=' + sys.executable)
 
         cfg = 'Debug' if self.debug else 'Release'
         build_args = ['--config', cfg]

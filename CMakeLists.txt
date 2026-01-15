@@ -71,11 +71,12 @@ if(SUPERANSAC_ENABLE_FAST_MATH)
 endif()
 
 # ---- IPO/LTO in a portable way ----
-include(CheckIPOSupported)
-check_ipo_supported(RESULT ipo_supported OUTPUT ipo_msg)
-if(ipo_supported)
-  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
-endif()
+# Disabled for pybind11 compatibility with Python 3.11
+# include(CheckIPOSupported)
+# check_ipo_supported(RESULT ipo_supported OUTPUT ipo_msg)
+# if(ipo_supported)
+#   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+# endif()
 
 # ---- Eigen: disable debug in release ----
 add_compile_definitions($<$<CONFIG:Release>:EIGEN_NO_DEBUG>)
