@@ -197,6 +197,9 @@ namespace superansac
 				coefficients0 *= ratio0;
 				coefficients1 *= ratio1;
 				
+				// Procrustes: H = src * dst^T, R = V * U^T gives R where src ≈ R * dst
+				// This means R^T transforms src to dst: dst ≈ R^T * src
+				// The estimator uses R^T @ src + t, so storing R directly works
 				Eigen::MatrixXd covariance =
 					coefficients0 * coefficients1.transpose();
 				

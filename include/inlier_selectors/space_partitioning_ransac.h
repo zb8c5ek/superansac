@@ -1457,8 +1457,7 @@ namespace superansac
                 // [2] = world X cell size
                 // [3] = world Y cell size
                 // [4] = world Z cell size
-                // [5] = 
-                ls per axis)
+                // [5] = division number (grid cells per axis)
                 
                 if (additionalParameters.size() < 6) {
                     // Fall back: return all cells if grid not properly initialized
