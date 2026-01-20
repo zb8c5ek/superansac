@@ -660,6 +660,124 @@ BundleStats bundle_adjust_1D_radial(const std::vector<Point2D> &x, const std::ve
     }
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+// Radial Fundamental Matrix refinement
+
+template <typename WeightType, typename LossFunction>
+BundleStats refine_radial_fundamental(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                      RadialFundamentalMatrixParams *params, const BundleOptions &opt,
+                                      const WeightType &weights) {
+    LossFunction loss_fn(opt.loss_scale);
+    IterationCallback callback = setup_callback(opt, loss_fn);
+    RadialFundamentalMatrixJacobianAccumulator<LossFunction, WeightType> accum(x1, x2, loss_fn, weights);
+    BundleStats stats = lm_impl<decltype(accum)>(accum, params, opt, callback);
+    return stats;
+}
+
+template <typename WeightType>
+BundleStats refine_radial_fundamental(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                      RadialFundamentalMatrixParams *params, const BundleOptions &opt,
+                                      const WeightType &weights) {
+    switch (opt.loss_type) {
+#define SWITCH_LOSS_FUNCTION_CASE(LossFunction)                                                                        \
+    return refine_radial_fundamental<WeightType, LossFunction>(x1, x2, params, opt, weights);
+        SWITCH_LOSS_FUNCTIONS
+    default:
+        return BundleStats();
+    }
+#undef SWITCH_LOSS_FUNCTION_CASE
+}
+
+// Entry point for radial fundamental matrix refinement
+BundleStats refine_radial_fundamental(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                      RadialFundamentalMatrixParams *params, const BundleOptions &opt,
+                                      const std::vector<double> &weights) {
+    if (weights.size() == x1.size()) {
+        return refine_radial_fundamental<std::vector<double>>(x1, x2, params, opt, weights);
+    } else {
+        return refine_radial_fundamental<UniformWeightVector>(x1, x2, params, opt, UniformWeightVector());
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+// Focal Fundamental Matrix refinement (F + focal lengths f1, f2)
+
+template <typename WeightType, typename LossFunction>
+BundleStats refine_focal_fundamental(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                     FocalFundamentalMatrixParams *params, const BundleOptions &opt,
+                                     const WeightType &weights) {
+    LossFunction loss_fn(opt.loss_scale);
+    IterationCallback callback = setup_callback(opt, loss_fn);
+    FocalFundamentalMatrixJacobianAccumulator<LossFunction, WeightType> accum(x1, x2, loss_fn, weights);
+    BundleStats stats = lm_impl<decltype(accum)>(accum, params, opt, callback);
+    return stats;
+}
+
+template <typename WeightType>
+BundleStats refine_focal_fundamental(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                     FocalFundamentalMatrixParams *params, const BundleOptions &opt,
+                                     const WeightType &weights) {
+    switch (opt.loss_type) {
+#define SWITCH_LOSS_FUNCTION_CASE(LossFunction)                                                                        \
+    return refine_focal_fundamental<WeightType, LossFunction>(x1, x2, params, opt, weights);
+        SWITCH_LOSS_FUNCTIONS
+    default:
+        return BundleStats();
+    }
+#undef SWITCH_LOSS_FUNCTION_CASE
+}
+
+// Entry point for focal fundamental matrix refinement
+BundleStats refine_focal_fundamental(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                     FocalFundamentalMatrixParams *params, const BundleOptions &opt,
+                                     const std::vector<double> &weights) {
+    if (weights.size() == x1.size()) {
+        return refine_focal_fundamental<std::vector<double>>(x1, x2, params, opt, weights);
+    } else {
+        return refine_focal_fundamental<UniformWeightVector>(x1, x2, params, opt, UniformWeightVector());
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+// Focal Relative Pose refinement (R, t, f1, f2 parameterization)
+// This is a more constrained optimization that ensures F comes from a valid essential matrix
+
+template <typename WeightType, typename LossFunction>
+BundleStats refine_focal_relpose(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                 FocalRelativePoseParams *params, const BundleOptions &opt,
+                                 const WeightType &weights) {
+    LossFunction loss_fn(opt.loss_scale);
+    IterationCallback callback = setup_callback(opt, loss_fn);
+    FocalRelativePoseJacobianAccumulator<LossFunction, WeightType> accum(x1, x2, loss_fn, weights);
+    BundleStats stats = lm_impl<decltype(accum)>(accum, params, opt, callback);
+    return stats;
+}
+
+template <typename WeightType>
+BundleStats refine_focal_relpose(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                 FocalRelativePoseParams *params, const BundleOptions &opt,
+                                 const WeightType &weights) {
+    switch (opt.loss_type) {
+#define SWITCH_LOSS_FUNCTION_CASE(LossFunction)                                                                        \
+    return refine_focal_relpose<WeightType, LossFunction>(x1, x2, params, opt, weights);
+        SWITCH_LOSS_FUNCTIONS
+    default:
+        return BundleStats();
+    }
+#undef SWITCH_LOSS_FUNCTION_CASE
+}
+
+// Entry point for focal relative pose refinement
+BundleStats refine_focal_relpose(const std::vector<Point2D> &x1, const std::vector<Point2D> &x2,
+                                 FocalRelativePoseParams *params, const BundleOptions &opt,
+                                 const std::vector<double> &weights) {
+    if (weights.size() == x1.size()) {
+        return refine_focal_relpose<std::vector<double>>(x1, x2, params, opt, weights);
+    } else {
+        return refine_focal_relpose<UniformWeightVector>(x1, x2, params, opt, UniformWeightVector());
+    }
+}
+
 #undef SWITCH_LOSS_FUNCTIONS
 
 } // namespace poselib
