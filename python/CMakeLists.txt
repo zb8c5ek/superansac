@@ -1,3 +1,9 @@
+# Explicit Python3 search (before pybind11 to control version)
+find_package(Python3 3.11 EXACT COMPONENTS Interpreter Development QUIET)
+if(NOT Python3_FOUND)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+endif()
+
 # Find Pybind11
 find_package(pybind11 CONFIG REQUIRED)
 if(NOT pybind11_FOUND)
@@ -12,6 +18,9 @@ pybind11_add_module(pysuperansac MODULE
   pybind_module.cpp
   pybind_functions.cpp
 )
+
+# Workaround for pybind11 + Python 3.11 compatibility
+target_compile_options(pysuperansac PRIVATE -Wno-error)
 
 # Link the C++ core library
 target_link_libraries(pysuperansac PRIVATE SupeRANSAC)

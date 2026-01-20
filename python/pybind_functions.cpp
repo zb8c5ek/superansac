@@ -14,6 +14,15 @@
 #include "estimators/solver_fundamental_matrix_bundle_adjustment.h"
 #include "estimators/estimator_fundamental_matrix.h"
 
+#include "estimators/solver_radial_fundamental_matrix_nine_point.h"
+#include "estimators/estimator_radial_fundamental_matrix.h"
+
+#include "estimators/solver_focal_fundamental_matrix_seven_point.h"
+#include "estimators/solver_focal_fundamental_matrix_rt_lm.h"
+#include "estimators/estimator_focal_fundamental_matrix.h"
+
+#include "estimators/numerical_optimizer/essential.h"
+
 #include "estimators/solver_rigid_transform_proscrutes.h"
 #include "estimators/estimator_rigid_transformation.h"
 
@@ -22,6 +31,8 @@
 #include "estimators/estimator_absolute_pose.h"
 
 #include "estimators/numerical_optimizer/types.h"
+#include "estimators/numerical_optimizer/bundle.h"
+#include "estimators/numerical_optimizer/jacobian_impl.h"
 
 #include "superansac.h"
 #include "samplers/types.h"
@@ -894,6 +905,357 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateFundame
         robustEstimator.getIterationNumber());
 }
 
+// Function to estimate radial fundamental matrix with division distortion
+std::tuple<Eigen::Matrix3d, std::vector<double>, std::vector<size_t>, double, size_t> estimateRadialFundamentalMatrix(
+    const DataMatrix& kCorrespondences_, // The point correspondences
+    const std::vector<double>& kPointProbabilities_, // The probabilities of the points being inliers
+    const std::vector<double>& kImageSizes_, // Image sizes (width source, height source, width destination, height destination)
+    superansac::RANSACSettings &settings_) // The RANSAC settings
+{
+    std::cerr.flush();
+
+    // Check if the input matrix has the correct dimensions
+    if (kCorrespondences_.cols() != 4) 
+        throw std::invalid_argument("The input matrix must have 4 columns (x1, y1, x2, y2).");
+    if (kCorrespondences_.rows() < 9) 
+        throw std::invalid_argument("The input matrix must have at least 9 rows for radial fundamental matrix estimation.");
+    if (kImageSizes_.size() != 4) 
+        throw std::invalid_argument("The image sizes must have 4 elements (height source, width source, height destination, width destination).");
+
+    // Normalize the point correspondences
+    DataMatrix normalizedCorrespondences;
+    Eigen::Matrix3d normalizingTransformSource, normalizingTransformDestination;
+    normalize2D2DPointCorrespondences(
+        kCorrespondences_,
+        normalizedCorrespondences,
+        normalizingTransformSource,
+        normalizingTransformDestination);   
+        
+    const double kScale = 
+        0.5 * (normalizingTransformSource(0, 0) + normalizingTransformDestination(0, 0));
+    settings_.inlierThreshold *= kScale;
+
+    // Get the values from the settings
+    const superansac::scoring::ScoringType kScoring = settings_.scoring;
+    const superansac::samplers::SamplerType kSampler = settings_.sampler;
+    const superansac::neighborhood::NeighborhoodType kNeighborhood = settings_.neighborhood;
+    const superansac::local_optimization::LocalOptimizationType kLocalOptimization = settings_.localOptimization;
+    const superansac::local_optimization::LocalOptimizationType kFinalOptimization = settings_.finalOptimization;
+    const superansac::termination::TerminationType kTerminationCriterion = settings_.terminationCriterion;
+
+    // Create the estimator (only uses minimal solver with 9-point)
+    std::unique_ptr<superansac::estimator::RadialFundamentalMatrixEstimator> estimator = 
+        std::unique_ptr<superansac::estimator::RadialFundamentalMatrixEstimator>(new superansac::estimator::RadialFundamentalMatrixEstimator());
+    
+    // Create the sampler (9 points for radial fundamental matrix solver)
+    std::unique_ptr<superansac::samplers::AbstractSampler> sampler = 
+        superansac::samplers::createSampler<9>(kSampler);
+    
+    // Create the neighborhood object (if needed)
+    std::unique_ptr<superansac::neighborhood::AbstractNeighborhoodGraph> neighborhoodGraph;
+
+    // Note: For 9-point solver, skip type-specific operations to avoid issues
+    // The sampler is already created with proper template parameters
+    if (kSampler == superansac::samplers::SamplerType::PROSAC)
+    {
+        dynamic_cast<superansac::samplers::PROSACSampler *>(sampler.get())->setSampleSize(estimator->sampleSize());
+    }
+    else if (kSampler == superansac::samplers::SamplerType::ProgressiveNAPSAC)
+    {
+        // auto pNapsacSampler = dynamic_cast<superansac::samplers::ProgressiveNAPSACSampler<9> *>(sampler.get());
+        // pNapsacSampler->setSampleSize(estimator->sampleSize());
+        // pNapsacSampler->setLayerData({ 16, 8, 4, 2 }, 
+        //     kImageSizes_);
+    } else if (kSampler == superansac::samplers::SamplerType::NAPSAC)
+    {
+        // Initialize the neighborhood graph
+        initializeNeighborhood<9>(
+            kCorrespondences_, // The point correspondences
+            neighborhoodGraph, // The neighborhood graph
+            kNeighborhood, // The type of the neighborhood
+            kImageSizes_, // Image sizes (height source, width source, height destination, width destination)
+            settings_); // The RANSAC settings
+        // Set the neighborhood graph to the sampler
+        dynamic_cast<superansac::samplers::NAPSACSampler *>(sampler.get())->setNeighborhood(neighborhoodGraph.get());
+    } else if (kSampler == superansac::samplers::SamplerType::ImportanceSampler)
+        dynamic_cast<superansac::samplers::ImportanceSampler *>(sampler.get())->setProbabilities(kPointProbabilities_); // Set the probabilities to the sampler
+    else if (kSampler == superansac::samplers::SamplerType::ARSampler)
+        dynamic_cast<superansac::samplers::AdaptiveReorderingSampler *>(sampler.get())->initialize(
+            &kCorrespondences_,
+            kPointProbabilities_,
+            settings_.arSamplerSettings.estimatorVariance,
+            settings_.arSamplerSettings.randomness);
+
+    sampler->initialize(kCorrespondences_); // Initialize the sampler
+
+    // Create the scoring object (for 4D point correspondence data)
+    std::unique_ptr<superansac::scoring::AbstractScoring> scorer = 
+        superansac::scoring::createScoring<4>(kScoring, settings_.useSprt);
+    scorer->setThreshold(settings_.inlierThreshold); // Set the threshold
+
+    // Set the image sizes if the scoring is ACRANSAC
+    if (kScoring == superansac::scoring::ScoringType::ACRANSAC)
+       scorer->setImageSize(kImageSizes_[0], kImageSizes_[1], kImageSizes_[2], kImageSizes_[3]);
+    else if (kScoring == superansac::scoring::ScoringType::MAGSAC) // Initialize the scoring object if the scoring is MAGSAC
+    {
+        if (settings_.useSprt)
+            dynamic_cast<superansac::scoring::MAGSACSPRTScoring *>(scorer.get())->initialize(estimator.get());
+        else
+            dynamic_cast<superansac::scoring::MAGSACScoring *>(scorer.get())->initialize(estimator.get());
+    }
+
+    // Create termination criterion object
+    std::unique_ptr<superansac::termination::AbstractCriterion> terminationCriterion =
+        superansac::termination::createTerminationCriterion(kTerminationCriterion);
+
+    if (kTerminationCriterion == superansac::termination::TerminationType::RANSAC)
+        dynamic_cast<superansac::termination::RANSACCriterion *>(terminationCriterion.get())->setConfidence(settings_.confidence);
+
+    // Create the RANSAC object
+    superansac::SupeRansac robustEstimator;
+
+    robustEstimator.setEstimator(estimator.get()); // Set the estimator
+    robustEstimator.setSampler(sampler.get()); // Set the sampler
+    robustEstimator.setScoring(scorer.get()); // Set the scoring method
+    robustEstimator.setTerminationCriterion(terminationCriterion.get()); // Set the termination criterion
+
+    // Set up local optimization if requested
+    std::unique_ptr<superansac::local_optimization::LocalOptimizer> localOptimizer;
+    if (kLocalOptimization != superansac::local_optimization::LocalOptimizationType::None)
+    {
+        localOptimizer = superansac::local_optimization::createLocalOptimizer(kLocalOptimization);
+
+        // For LSQ optimization, enable using inliers for nonminimal estimation
+        if (kLocalOptimization == superansac::local_optimization::LocalOptimizationType::LSQ)
+        {
+            auto lsqLocalOptimizer = dynamic_cast<superansac::local_optimization::LeastSquaresOptimizer *>(localOptimizer.get());
+            lsqLocalOptimizer->setUseInliers(true);
+        }
+        else if (kLocalOptimization == superansac::local_optimization::LocalOptimizationType::IRLS)
+        {
+            auto irlsLocalOptimizer = dynamic_cast<superansac::local_optimization::IRLSOptimizer *>(localOptimizer.get());
+            irlsLocalOptimizer->setUseInliers(true);
+        }
+
+        robustEstimator.setLocalOptimizer(localOptimizer.get());
+    }
+
+    // Set up final optimization if requested
+    std::unique_ptr<superansac::local_optimization::LocalOptimizer> finalOptimizer;
+    if (kFinalOptimization != superansac::local_optimization::LocalOptimizationType::None)
+    {
+        finalOptimizer = superansac::local_optimization::createLocalOptimizer(kFinalOptimization);
+
+        // For LSQ optimization, enable using inliers for nonminimal estimation
+        if (kFinalOptimization == superansac::local_optimization::LocalOptimizationType::LSQ)
+        {
+            auto lsqFinalOptimizer = dynamic_cast<superansac::local_optimization::LeastSquaresOptimizer *>(finalOptimizer.get());
+            lsqFinalOptimizer->setUseInliers(true);
+        }
+        else if (kFinalOptimization == superansac::local_optimization::LocalOptimizationType::IRLS)
+        {
+            auto irlsFinalOptimizer = dynamic_cast<superansac::local_optimization::IRLSOptimizer *>(finalOptimizer.get());
+            irlsFinalOptimizer->setUseInliers(true);
+        }
+
+        robustEstimator.setFinalOptimizer(finalOptimizer.get());
+    }
+
+    robustEstimator.setSettings(settings_);
+    
+    size_t sampleSize;
+    try {
+        sampleSize = estimator->sampleSize();
+    } catch (const std::exception& e) {
+        throw;
+    }
+    
+    // Run the robust estimator
+    try {
+        robustEstimator.run(normalizedCorrespondences);
+    } catch (const std::exception& e) {
+        throw;
+    } catch (...) {
+        throw;
+    }
+
+    // Check if the model is valid
+    if (robustEstimator.getInliers().size() < estimator->sampleSize())
+        return std::make_tuple(Eigen::Matrix3d::Identity(), std::vector<double>(), std::vector<size_t>(), 0.0, robustEstimator.getIterationNumber());
+
+    // Get the normalized fundamental matrix and distortion parameters
+    Eigen::MatrixXd modelDescriptor = robustEstimator.getBestModel().getData();
+    Eigen::Matrix3d fundamentalMatrix = modelDescriptor.block<3, 3>(0, 0);
+    double lam1 = modelDescriptor(0, 3);
+    double lam2 = modelDescriptor(1, 3);
+
+    // Transform the estimated fundamental matrix back to the not normalized space
+    fundamentalMatrix = normalizingTransformDestination.transpose() * fundamentalMatrix * normalizingTransformSource;
+    fundamentalMatrix.normalize();
+
+    // Scale the lambda parameters back
+    // If p_normalized = scale * p_centered, then lambda_centered = lambda_normalized * scale^2
+    double scale1 = normalizingTransformSource(0, 0);
+    double scale2 = normalizingTransformDestination(0, 0);
+    lam1 = lam1 * (scale1 * scale1);
+    lam2 = lam2 * (scale2 * scale2);
+
+    std::vector<double> distortionParams = {lam1, lam2};
+
+    // Return the best model with the inliers, distortion parameters, and the score
+    return std::make_tuple(fundamentalMatrix, 
+        distortionParams,
+        robustEstimator.getInliers(), 
+        robustEstimator.getBestScore().getValue(), 
+        robustEstimator.getIterationNumber());
+}
+
+// Function to refine radial fundamental matrix using LM optimization on inlier points
+std::tuple<Eigen::Matrix3d, std::vector<double>, double> refineRadialFundamentalMatrixLM(
+    const DataMatrix& kCorrespondences_, // The point correspondences
+    const Eigen::Matrix3d& kInitialF_, // Initial fundamental matrix
+    const std::vector<double>& kInitialDistortion_, // Initial distortion [lam1, lam2]
+    const std::vector<size_t>& kInlierIndices_) // Indices of inlier points
+{
+    // Extract inlier points
+    std::vector<Eigen::Vector2d> x1, x2;
+    for (const size_t idx : kInlierIndices_)
+    {
+        x1.push_back(Eigen::Vector2d(kCorrespondences_(idx, 0), kCorrespondences_(idx, 1)));
+        x2.push_back(Eigen::Vector2d(kCorrespondences_(idx, 2), kCorrespondences_(idx, 3)));
+    }
+
+    // Initialize parameters
+    poselib::RadialFundamentalMatrixParams params(
+        kInitialF_,
+        kInitialDistortion_.size() > 0 ? kInitialDistortion_[0] : 0.0,
+        kInitialDistortion_.size() > 1 ? kInitialDistortion_[1] : 0.0);
+
+    // Configure LM options
+    poselib::BundleOptions lm_options;
+    lm_options.max_iterations = 100;
+    lm_options.loss_type = poselib::BundleOptions::LossType::CAUCHY;
+    lm_options.loss_scale = 0.5;
+
+    // Run Levenberg-Marquardt optimization
+    poselib::BundleStats stats = poselib::refine_radial_fundamental(x1, x2, &params, lm_options, std::vector<double>());
+
+    // Return refined parameters
+    std::vector<double> distortion{params.lam1, params.lam2};
+    return std::make_tuple(params.F, distortion, stats.cost);
+}
+
+// Helper function to compute the Essential matrix from F and focal lengths
+// E = diag(f2, f2, 1) * F * diag(f1, f1, 1)
+inline Eigen::Matrix3d computeEssentialFromF(const Eigen::Matrix3d& F, double f1, double f2)
+{
+    Eigen::Matrix3d E = F;
+    // Multiply rows 0,1 by f2
+    E.row(0) *= f2;
+    E.row(1) *= f2;
+    // Multiply cols 0,1 by f1
+    E.col(0) *= f1;
+    E.col(1) *= f1;
+    return E;
+}
+
+// Compute the essential matrix constraint error: |sigma1 - sigma2| / sigma1
+// For a valid essential matrix, the two largest singular values should be equal
+inline double essentialConstraintError(const Eigen::Matrix3d& F, double f1, double f2)
+{
+    Eigen::Matrix3d E = computeEssentialFromF(F, f1, f2);
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(E);
+    Eigen::Vector3d s = svd.singularValues();
+    if (s(0) < 1e-10) return 1e10;
+    return std::abs(s(0) - s(1)) / s(0);
+}
+
+// Extract focal lengths from F by minimizing the essential matrix constraint
+// Uses golden section search for efficiency
+std::pair<double, double> extractFocalLengthsFromEssentialConstraint(
+    const Eigen::Matrix3d& F, double f_init = 500.0)
+{
+    const double min_f = 50.0;
+    const double max_f = 5000.0;
+    const int grid_size = 20;
+    const double tol = 1.0;  // 1 pixel tolerance
+
+    // Phase 1: Coarse grid search
+    double best_f1 = f_init, best_f2 = f_init;
+    double best_err = essentialConstraintError(F, f_init, f_init);
+
+    for (int i = 0; i < grid_size; ++i) {
+        double f1 = min_f + (max_f - min_f) * i / (grid_size - 1);
+        for (int j = 0; j < grid_size; ++j) {
+            double f2 = min_f + (max_f - min_f) * j / (grid_size - 1);
+            double err = essentialConstraintError(F, f1, f2);
+            if (err < best_err) {
+                best_err = err;
+                best_f1 = f1;
+                best_f2 = f2;
+            }
+        }
+    }
+
+    // Phase 2: Local refinement using coordinate descent
+    double step = (max_f - min_f) / grid_size / 2;
+    for (int iter = 0; iter < 10 && step > tol; ++iter) {
+        // Refine f1
+        for (double df = -step; df <= step; df += step/2) {
+            double f1_new = std::max(min_f, std::min(max_f, best_f1 + df));
+            double err = essentialConstraintError(F, f1_new, best_f2);
+            if (err < best_err) {
+                best_err = err;
+                best_f1 = f1_new;
+            }
+        }
+        // Refine f2
+        for (double df = -step; df <= step; df += step/2) {
+            double f2_new = std::max(min_f, std::min(max_f, best_f2 + df));
+            double err = essentialConstraintError(F, best_f1, f2_new);
+            if (err < best_err) {
+                best_err = err;
+                best_f2 = f2_new;
+            }
+        }
+        step /= 2;
+    }
+
+    return {best_f1, best_f2};
+}
+
+// Function to extract focal lengths from a fundamental matrix
+// Uses the essential matrix constraint: E = K2^T * F * K1 should have two equal singular values
+std::tuple<Eigen::Matrix3d, std::vector<double>, double> refineFocalFundamentalMatrixLM(
+    const DataMatrix& kCorrespondences_, // The point correspondences (centered at principal point)
+    const Eigen::Matrix3d& kInitialF_, // Initial fundamental matrix
+    const std::vector<double>& kInitialFocals_, // Initial focal lengths [f1, f2]
+    const std::vector<size_t>& kInlierIndices_) // Indices of inlier points
+{
+    // NOTE: We do NOT refine F with poselib::refine_fundamental here because
+    // that refinement optimizes pixel-space Sampson error which changes F's
+    // structure in a way that makes focal length extraction unreliable.
+    //
+    // Instead, we work directly with the RANSAC-estimated F, which preserves
+    // the epipolar geometry needed for focal length extraction.
+
+    // Normalize F so that ||F|| = 1
+    Eigen::Matrix3d F_normalized = kInitialF_ / kInitialF_.norm();
+
+    // Extract focal lengths using essential matrix constraint
+    // The constraint is that E = K2^T * F * K1 should have two equal singular values
+    // We use optimization to find f1, f2 that minimize |sigma1 - sigma2|
+    double f_init = kInitialFocals_.size() > 0 ? kInitialFocals_[0] : 500.0;
+    auto [f1_est, f2_est] = extractFocalLengthsFromEssentialConstraint(F_normalized, f_init);
+
+    // Compute the essential matrix error for reporting
+    double essential_err = essentialConstraintError(F_normalized, f1_est, f2_est);
+
+    // Return the normalized F with estimated focal lengths
+    std::vector<double> focals{f1_est, f2_est};
+    return std::make_tuple(F_normalized, focals, essential_err);
+}
+
 std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateEssentialMatrix(
     const DataMatrix& kCorrespondences_, // The point correspondences
     const Eigen::Matrix3d &kIntrinsicsSource_, // The intrinsic matrix of the source camera
@@ -1343,8 +1705,313 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateHomogra
         return std::make_tuple(Eigen::Matrix3d::Identity(), std::vector<size_t>(), 0.0, robustEstimator.getIterationNumber());
 
     // Return the best model with the inliers and the score
-    return std::make_tuple(robustEstimator.getBestModel().getData(), 
-        robustEstimator.getInliers(), 
-        robustEstimator.getBestScore().getValue(), 
+    return std::make_tuple(robustEstimator.getBestModel().getData(),
+        robustEstimator.getInliers(),
+        robustEstimator.getBestScore().getValue(),
+        robustEstimator.getIterationNumber());
+}
+
+// Function to refine F and focal lengths using R+t parameterization
+// This ensures F always corresponds to a valid essential matrix
+std::tuple<Eigen::Matrix3d, std::vector<double>, double> refineFocalFundamentalMatrixRTLM(
+    const DataMatrix& kCorrespondences_, // The point correspondences (centered at principal point)
+    const Eigen::Matrix3d& kInitialF_, // Initial fundamental matrix
+    const std::vector<double>& kInitialFocals_, // Initial focal lengths [f1, f2]
+    const std::vector<size_t>& kInlierIndices_) // Indices of inlier points
+{
+    if (kInitialFocals_.size() != 2)
+        throw std::invalid_argument("Initial focal lengths must have 2 elements [f1, f2].");
+    if (kInlierIndices_.empty())
+        throw std::invalid_argument("Inlier indices cannot be empty.");
+
+    double f1_init = kInitialFocals_[0];
+    double f2_init = kInitialFocals_[1];
+
+    // Compute E from F and initial focal lengths
+    // E = K2^T * F * K1
+    Eigen::Matrix3d K1 = Eigen::Matrix3d::Identity();
+    K1(0, 0) = f1_init;
+    K1(1, 1) = f1_init;
+    Eigen::Matrix3d K2 = Eigen::Matrix3d::Identity();
+    K2(0, 0) = f2_init;
+    K2(1, 1) = f2_init;
+
+    Eigen::Matrix3d E_init = K2.transpose() * kInitialF_ * K1;
+
+    // Normalize E via SVD to ensure valid essential matrix
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(E_init, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    double avg_sv = (svd.singularValues()(0) + svd.singularValues()(1)) / 2.0;
+    Eigen::Matrix3d E_valid = svd.matrixU() * Eigen::Vector3d(avg_sv, avg_sv, 0.0).asDiagonal() * svd.matrixV().transpose();
+
+    // Prepare normalized points for pose recovery
+    std::vector<Eigen::Vector3d> x1_normalized, x2_normalized;
+    x1_normalized.reserve(kInlierIndices_.size());
+    x2_normalized.reserve(kInlierIndices_.size());
+
+    for (size_t idx : kInlierIndices_)
+    {
+        if (idx >= static_cast<size_t>(kCorrespondences_.rows()))
+            continue;
+        x1_normalized.emplace_back(kCorrespondences_(idx, 0) / f1_init, kCorrespondences_(idx, 1) / f1_init, 1.0);
+        x2_normalized.emplace_back(kCorrespondences_(idx, 2) / f2_init, kCorrespondences_(idx, 3) / f2_init, 1.0);
+    }
+
+    // Decompose E into R, t
+    poselib::CameraPoseVector relative_poses;
+    poselib::motion_from_essential(E_valid, x1_normalized, x2_normalized, &relative_poses);
+
+    if (relative_poses.empty())
+    {
+        // Return original values if decomposition fails
+        std::vector<double> focals{f1_init, f2_init};
+        return std::make_tuple(kInitialF_, focals, -1.0);
+    }
+
+    poselib::CameraPose best_pose = relative_poses[0];
+
+    // Prepare points for LM refinement
+    std::vector<poselib::Point2D> points1, points2;
+    points1.reserve(kInlierIndices_.size());
+    points2.reserve(kInlierIndices_.size());
+
+    for (size_t idx : kInlierIndices_)
+    {
+        if (idx >= static_cast<size_t>(kCorrespondences_.rows()))
+            continue;
+        points1.emplace_back(kCorrespondences_(idx, 0), kCorrespondences_(idx, 1));
+        points2.emplace_back(kCorrespondences_(idx, 2), kCorrespondences_(idx, 3));
+    }
+
+    // Set up LM refinement with R+t+focal parameterization
+    poselib::FocalRelativePoseParams params(best_pose, f1_init, f2_init);
+
+    poselib::BundleOptions opts;
+    opts.loss_type = poselib::BundleOptions::LossType::CAUCHY;
+    opts.loss_scale = 1.0;
+    opts.max_iterations = 50;
+    opts.gradient_tol = 1e-10;
+    opts.step_tol = 1e-8;
+
+    // Run refinement
+    poselib::BundleStats stats = poselib::refine_focal_relpose(
+        points1, points2, &params, opts, std::vector<double>());
+
+    // Extract refined F from params
+    Eigen::Matrix3d F_refined = params.F();
+    F_refined.normalize();
+
+    std::vector<double> focals{params.f1, params.f2};
+    return std::make_tuple(F_refined, focals, stats.cost);
+}
+
+// Function to estimate focal fundamental matrix using RANSAC
+// Uses 7-point + Bougnoux minimal solver for focal length extraction
+// Uses R+t parameterized LM non-minimal solver
+std::tuple<Eigen::Matrix3d, std::vector<double>, std::vector<size_t>, double, size_t> estimateFocalFundamentalMatrix(
+    const DataMatrix& kCorrespondences_, // The point correspondences (centered at principal point)
+    const std::vector<double>& kPointProbabilities_, // The probabilities of the points being inliers
+    const std::vector<double>& kImageSizes_, // Image sizes (width source, height source, width destination, height destination)
+    superansac::RANSACSettings &settings_) // The RANSAC settings
+{
+    // Check if the input matrix has the correct dimensions
+    if (kCorrespondences_.cols() != 4)
+        throw std::invalid_argument("The input matrix must have 4 columns (x1, y1, x2, y2).");
+    if (kCorrespondences_.rows() < 7)
+        throw std::invalid_argument("The input matrix must have at least 7 rows for focal fundamental matrix estimation.");
+    if (kImageSizes_.size() != 4)
+        throw std::invalid_argument("The image sizes must have 4 elements (height source, width source, height destination, width destination).");
+
+    // Normalize the point correspondences for numerical stability
+    DataMatrix normalizedCorrespondences;
+    Eigen::Matrix3d normalizingTransformSource, normalizingTransformDestination;
+    normalize2D2DPointCorrespondences(
+        kCorrespondences_,
+        normalizedCorrespondences,
+        normalizingTransformSource,
+        normalizingTransformDestination);
+
+    const double kScale =
+        0.5 * (normalizingTransformSource(0, 0) + normalizingTransformDestination(0, 0));
+    settings_.inlierThreshold *= kScale;
+
+    // Get the values from the settings
+    const superansac::scoring::ScoringType kScoring = settings_.scoring;
+    const superansac::samplers::SamplerType kSampler = settings_.sampler;
+    const superansac::neighborhood::NeighborhoodType kNeighborhood = settings_.neighborhood;
+    const superansac::local_optimization::LocalOptimizationType kLocalOptimization = settings_.localOptimization;
+    const superansac::local_optimization::LocalOptimizationType kFinalOptimization = settings_.finalOptimization;
+    const superansac::termination::TerminationType kTerminationCriterion = settings_.terminationCriterion;
+
+    // Use the standard FundamentalMatrixEstimator to ensure identical results
+    std::unique_ptr<superansac::estimator::FundamentalMatrixEstimator> estimator =
+        std::unique_ptr<superansac::estimator::FundamentalMatrixEstimator>(new superansac::estimator::FundamentalMatrixEstimator());
+    estimator->setMinimalSolver(new superansac::estimator::solver::FundamentalMatrixSevenPointSolver());
+    estimator->setNonMinimalSolver(new superansac::estimator::solver::FundamentalMatrixBundleAdjustmentSolver());
+
+    // Configure the BA solver with truncated loss (same as standard F)
+    superansac::estimator::solver::FundamentalMatrixBundleAdjustmentSolver* nonminimalSolver =
+        dynamic_cast<superansac::estimator::solver::FundamentalMatrixBundleAdjustmentSolver*>(estimator->getMutableNonMinimalSolver());
+    if (nonminimalSolver != nullptr)
+    {
+        if (kPointProbabilities_.size() > 0)
+            nonminimalSolver->setWeights(&kPointProbabilities_);
+        auto& solverOptions = nonminimalSolver->getMutableOptions();
+        solverOptions.loss_type = poselib::BundleOptions::LossType::TRUNCATED;
+        solverOptions.loss_scale = settings_.inlierThreshold;
+        solverOptions.max_iterations = 25;
+    }
+
+    // Create the sampler (4D data: x1, y1, x2, y2; sample size 7 is set separately)
+    std::unique_ptr<superansac::samplers::AbstractSampler> sampler =
+        superansac::samplers::createSampler<4>(kSampler);
+
+    // Create the neighborhood object (if needed)
+    std::unique_ptr<superansac::neighborhood::AbstractNeighborhoodGraph> neighborhoodGraph;
+
+    // Configure sampler based on type
+    if (kSampler == superansac::samplers::SamplerType::PROSAC)
+    {
+        dynamic_cast<superansac::samplers::PROSACSampler *>(sampler.get())->setSampleSize(estimator->sampleSize());
+    }
+    else if (kSampler == superansac::samplers::SamplerType::ProgressiveNAPSAC)
+    {
+        auto pNapsacSampler = dynamic_cast<superansac::samplers::ProgressiveNAPSACSampler<4> *>(sampler.get());
+        pNapsacSampler->setSampleSize(estimator->sampleSize());
+        pNapsacSampler->setLayerData({ 16, 8, 4, 2 }, kImageSizes_);
+    }
+    else if (kSampler == superansac::samplers::SamplerType::NAPSAC)
+    {
+        // Initialize the neighborhood graph
+        initializeNeighborhood<4>(
+            kCorrespondences_,
+            neighborhoodGraph,
+            kNeighborhood,
+            kImageSizes_,
+            settings_);
+        dynamic_cast<superansac::samplers::NAPSACSampler *>(sampler.get())->setNeighborhood(neighborhoodGraph.get());
+    }
+    else if (kSampler == superansac::samplers::SamplerType::ImportanceSampler)
+        dynamic_cast<superansac::samplers::ImportanceSampler *>(sampler.get())->setProbabilities(kPointProbabilities_);
+    else if (kSampler == superansac::samplers::SamplerType::ARSampler)
+        dynamic_cast<superansac::samplers::AdaptiveReorderingSampler *>(sampler.get())->initialize(
+            &kCorrespondences_,
+            kPointProbabilities_,
+            settings_.arSamplerSettings.estimatorVariance,
+            settings_.arSamplerSettings.randomness);
+
+    sampler->initialize(kCorrespondences_);
+
+    // Create the scoring object (for 4D point correspondence data)
+    std::unique_ptr<superansac::scoring::AbstractScoring> scorer =
+        superansac::scoring::createScoring<4>(kScoring, settings_.useSprt);
+    scorer->setThreshold(settings_.inlierThreshold);
+
+    // Set the image sizes if the scoring is ACRANSAC
+    if (kScoring == superansac::scoring::ScoringType::ACRANSAC)
+       scorer->setImageSize(kImageSizes_[0], kImageSizes_[1], kImageSizes_[2], kImageSizes_[3]);
+    else if (kScoring == superansac::scoring::ScoringType::MAGSAC)
+    {
+        if (settings_.useSprt)
+            dynamic_cast<superansac::scoring::MAGSACSPRTScoring *>(scorer.get())->initialize(estimator.get());
+        else
+            dynamic_cast<superansac::scoring::MAGSACScoring *>(scorer.get())->initialize(estimator.get());
+        // Update solver options for MAGSAC scoring (same as standard F)
+        if (nonminimalSolver != nullptr)
+        {
+            auto& solverOptions = nonminimalSolver->getMutableOptions();
+            solverOptions.loss_type = poselib::BundleOptions::LossType::MAGSACPlusPlus;
+        }
+    }
+
+    // Create termination criterion object
+    std::unique_ptr<superansac::termination::AbstractCriterion> terminationCriterion =
+        superansac::termination::createTerminationCriterion(kTerminationCriterion);
+
+    if (kTerminationCriterion == superansac::termination::TerminationType::RANSAC)
+        dynamic_cast<superansac::termination::RANSACCriterion *>(terminationCriterion.get())->setConfidence(settings_.confidence);
+
+    // Create the RANSAC object
+    superansac::SupeRansac robustEstimator;
+
+    robustEstimator.setEstimator(estimator.get());
+    robustEstimator.setSampler(sampler.get());
+    robustEstimator.setScoring(scorer.get());
+    robustEstimator.setTerminationCriterion(terminationCriterion.get());
+
+    // Set up local optimization if requested (same initialization as standard F)
+    std::unique_ptr<superansac::local_optimization::LocalOptimizer> localOptimizer;
+    if (kLocalOptimization != superansac::local_optimization::LocalOptimizationType::None)
+    {
+        localOptimizer = superansac::local_optimization::createLocalOptimizer(kLocalOptimization);
+
+        initializeLocalOptimizer<4>(
+            kCorrespondences_,
+            localOptimizer,
+            neighborhoodGraph,
+            kNeighborhood,
+            kLocalOptimization,
+            kImageSizes_,
+            settings_,
+            settings_.localOptimizationSettings,
+            superansac::models::Types::FundamentalMatrix,
+            false);
+
+        robustEstimator.setLocalOptimizer(localOptimizer.get());
+    }
+
+    // Set up final optimization if requested (same initialization as standard F)
+    std::unique_ptr<superansac::local_optimization::LocalOptimizer> finalOptimizer;
+    if (kFinalOptimization != superansac::local_optimization::LocalOptimizationType::None)
+    {
+        finalOptimizer = superansac::local_optimization::createLocalOptimizer(kFinalOptimization);
+
+        initializeLocalOptimizer<4>(
+            kCorrespondences_,
+            finalOptimizer,
+            neighborhoodGraph,
+            kNeighborhood,
+            kFinalOptimization,
+            kImageSizes_,
+            settings_,
+            settings_.finalOptimizationSettings,
+            superansac::models::Types::FundamentalMatrix,
+            true);
+
+        robustEstimator.setFinalOptimizer(finalOptimizer.get());
+    }
+
+    robustEstimator.setSettings(settings_);
+
+    // Run the robust estimator on normalized correspondences
+    robustEstimator.run(normalizedCorrespondences);
+
+    // Check if the model is valid
+    if (robustEstimator.getInliers().size() < estimator->sampleSize())
+        return std::make_tuple(Eigen::Matrix3d::Identity(), std::vector<double>(), std::vector<size_t>(), 0.0, robustEstimator.getIterationNumber());
+
+    // Get the fundamental matrix and focal lengths
+    // Descriptor is 3x4: [F (3x3) | f1, f2, 0]
+    Eigen::MatrixXd modelDescriptor = robustEstimator.getBestModel().getData();
+    Eigen::Matrix3d fundamentalMatrix = modelDescriptor.block<3, 3>(0, 0);
+
+    // De-normalize the fundamental matrix: F_orig = T2^T * F_norm * T1
+    fundamentalMatrix = normalizingTransformDestination.transpose() * fundamentalMatrix * normalizingTransformSource;
+    fundamentalMatrix.normalize();
+
+    // Extract focal lengths from de-normalized F using Bougnoux formula
+    // (The focal lengths from normalized F are not valid for original coordinates)
+    double f1, f2;
+    double maxCoord = kCorrespondences_.array().abs().maxCoeff();
+    double fallbackFocal = std::max(300.0, maxCoord * 1.5);
+    superansac::estimator::solver::FocalFundamentalMatrixSevenPointSolver::extractFocalLengths(
+        fundamentalMatrix, f1, f2, fallbackFocal, true);
+
+    std::vector<double> focalLengths = {f1, f2};
+
+    // Return the best model with the inliers, focal lengths, and the score
+    return std::make_tuple(fundamentalMatrix,
+        focalLengths,
+        robustEstimator.getInliers(),
+        robustEstimator.getBestScore().getValue(),
         robustEstimator.getIterationNumber());
 }

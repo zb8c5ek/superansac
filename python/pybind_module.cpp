@@ -1,4 +1,22 @@
+#include <Python.h>
+
+// Workaround for pybind11 + Python 3.11 PyFrameObject issue
+// Define PyFrameObject structure as opaque to prevent access to f_back
+typedef struct _frame {
+    struct _frame *f_back;
+    PyObject *f_builtins;
+    PyObject *f_globals;
+    PyObject *f_locals;
+    PyFrameObject *f_back_unsafe;
+    int f_lasti;
+    int f_lineno;
+} PyFrameObject;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
 #include <pybind11/pybind11.h>
+#pragma GCC diagnostic pop
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
@@ -34,6 +52,36 @@ std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateFundame
     const std::vector<double>& kImageSizes_, // Image sizes (height source, width source, height destination, width destination)
     superansac::RANSACSettings& settings_); // The RANSAC settings
 
+std::tuple<Eigen::Matrix3d, std::vector<double>, std::vector<size_t>, double, size_t> estimateRadialFundamentalMatrix(
+    const DataMatrix& kCorrespondences_, // The point correspondences
+    const std::vector<double>& kPointProbabilities_, // The probabilities of the points being inliers
+    const std::vector<double>& kImageSizes_, // Image sizes (height source, width source, height destination, width destination)
+    superansac::RANSACSettings& settings_); // The RANSAC settings
+
+std::tuple<Eigen::Matrix3d, std::vector<double>, double> refineRadialFundamentalMatrixLM(
+    const DataMatrix& kCorrespondences_, // The point correspondences
+    const Eigen::Matrix3d& kInitialF_, // Initial fundamental matrix
+    const std::vector<double>& kInitialDistortion_, // Initial distortion [lam1, lam2]
+    const std::vector<size_t>& kInlierIndices_); // Indices of inlier points
+
+std::tuple<Eigen::Matrix3d, std::vector<double>, double> refineFocalFundamentalMatrixLM(
+    const DataMatrix& kCorrespondences_, // The point correspondences (centered at principal point)
+    const Eigen::Matrix3d& kInitialF_, // Initial fundamental matrix
+    const std::vector<double>& kInitialFocals_, // Initial focal lengths [f1, f2]
+    const std::vector<size_t>& kInlierIndices_); // Indices of inlier points
+
+std::tuple<Eigen::Matrix3d, std::vector<double>, double> refineFocalFundamentalMatrixRTLM(
+    const DataMatrix& kCorrespondences_, // The point correspondences (centered at principal point)
+    const Eigen::Matrix3d& kInitialF_, // Initial fundamental matrix
+    const std::vector<double>& kInitialFocals_, // Initial focal lengths [f1, f2]
+    const std::vector<size_t>& kInlierIndices_); // Indices of inlier points
+
+std::tuple<Eigen::Matrix3d, std::vector<double>, std::vector<size_t>, double, size_t> estimateFocalFundamentalMatrix(
+    const DataMatrix& kCorrespondences_, // The point correspondences (centered at principal point)
+    const std::vector<double>& kPointProbabilities_, // The probabilities of the points being inliers
+    const std::vector<double>& kImageSizes_, // Image sizes (width source, height source, width destination, height destination)
+    superansac::RANSACSettings& settings_); // The RANSAC settings
+
 std::tuple<Eigen::Matrix3d, std::vector<size_t>, double, size_t> estimateEssentialMatrix(
     const DataMatrix& kCorrespondences_, // The point correspondences
     const Eigen::Matrix3d& kIntrinsicsSource_, // The intrinsic matrix of the source camera
@@ -55,6 +103,13 @@ std::tuple<Eigen::Matrix3d, Eigen::Vector3d, std::vector<size_t>, double, size_t
     const std::vector<double>& kBoundingBox_, // The bounding box dimensions (image width, image height, X, Y, Z)
     const std::vector<double>& kPointProbabilities_, // The probabilities of the points being inliers
     superansac::RANSACSettings& settings_); // The RANSAC settings
+
+// Validate that a buffer is a 1D array.
+static inline void require_1d(const py::buffer_info& b, const char* name) {
+    if (b.ndim != 1) {
+        throw std::runtime_error(std::string(name) + " must be a 1D array");
+    }
+}
 
 // Validate that a buffer is a 2D array.
 static inline void require_2d(const py::buffer_info& b, const char* name) {
@@ -286,6 +341,58 @@ PYBIND11_MODULE(pysuperansac, m) {
         py::arg("probabilities") = py::none(),
         py::arg("config") = superansac::RANSACSettings());
 
+    // Test: expose a simplified estimateRadialFundamentalMatrix for testing
+    // (will add full version after testing)
+    m.def(
+        "estimateRadialFundamentalMatrix",
+        [](py::array_t<double, py::array::c_style> correspondences,
+           py::array_t<double, py::array::c_style> image_sizes,
+           py::object probabilities,
+           superansac::RANSACSettings& config) {
+
+            try {
+                // Get buffer metadata for correspondences.
+                auto buf = correspondences.request();
+
+                // Validate that correspondences is a 2D array.
+                require_2d(buf, "correspondences");
+
+                // Map correspondences without copying into an Eigen row-major matrix view.
+                Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> mat(
+                    static_cast<const double*>(buf.ptr),
+                    static_cast<Eigen::Index>(buf.shape[0]),
+                    static_cast<Eigen::Index>(buf.shape[1]));
+
+                // Validate image_sizes has exactly 4 elements and copy into a fixed-size array.
+                const auto img4 = require_1d_fixed_f64<4>(image_sizes, "image_sizes");
+
+                // Convert fixed-size image sizes into std::vector<double> for the estimator API.
+                std::vector<double> img_vec(img4.begin(), img4.end());
+
+                // Convert optional probabilities (None or 1D float64 array) into std::vector<double>.
+                std::vector<double> prob_vec = probs_from_optional(probabilities);
+
+                // Release the GIL for the heavy C++ computation.
+                py::gil_scoped_release release;
+
+                // Call the estimator.
+                return estimateRadialFundamentalMatrix(mat, prob_vec, img_vec, config);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("C++ exception in estimateRadialFundamentalMatrix: ") + e.what());
+            } catch (...) {
+                throw std::runtime_error("Unknown exception in estimateRadialFundamentalMatrix");
+            }
+        },
+        "A function that performs radial fundamental matrix estimation from point correspondences with division distortion model.",
+        py::arg("correspondences"),
+        py::arg("image_sizes"),
+        py::arg("probabilities") = py::none(),
+        py::arg("config") = superansac::RANSACSettings());
+
+        // Test simple function
+    m.def("testRadialFunction", []() { return py::str("This is a test function"); });
+
+
     // Expose the function to Python
     m.def(
         "estimateEssentialMatrix",
@@ -443,6 +550,232 @@ PYBIND11_MODULE(pysuperansac, m) {
         py::arg("camera_type"),
         py::arg("camera_params"),
         py::arg("bounding_box"),
+        py::arg("probabilities") = py::none(),
+        py::arg("config") = superansac::RANSACSettings());
+
+    // Expose refineRadialFundamentalMatrixLM function for non-minimal refinement
+    m.def(
+        "refineRadialFundamentalMatrixLM",
+        [](py::array_t<double, py::array::c_style> correspondences,
+           py::array_t<double, py::array::c_style> initial_f,
+           py::array_t<double, py::array::c_style> initial_distortion,
+           py::array_t<size_t, py::array::c_style> inlier_indices) {
+
+            try {
+                // Get buffer metadata for correspondences.
+                auto buf_corr = correspondences.request();
+                require_2d(buf_corr, "correspondences");
+
+                // Map correspondences without copying into an Eigen row-major matrix view.
+                Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> mat(
+                    static_cast<const double*>(buf_corr.ptr),
+                    static_cast<Eigen::Index>(buf_corr.shape[0]),
+                    static_cast<Eigen::Index>(buf_corr.shape[1]));
+
+                // Extract initial_f as 3x3 matrix
+                auto buf_f = initial_f.request();
+                require_1d(buf_f, "initial_f");
+                if (buf_f.shape[0] != 9)
+                    throw std::invalid_argument("initial_f must have 9 elements (3x3 matrix)");
+                
+                Eigen::Matrix3d f;
+                const double* f_ptr = static_cast<const double*>(buf_f.ptr);
+                f << f_ptr[0], f_ptr[1], f_ptr[2],
+                     f_ptr[3], f_ptr[4], f_ptr[5],
+                     f_ptr[6], f_ptr[7], f_ptr[8];
+
+                // Extract initial_distortion as [lam1, lam2]
+                std::vector<double> dist_vec = vec_from_1d_f64(initial_distortion, "initial_distortion");
+                if (dist_vec.size() != 2)
+                    throw std::invalid_argument("initial_distortion must have exactly 2 elements [lam1, lam2]");
+
+                // Extract inlier_indices as vector of size_t
+                auto buf_idx = inlier_indices.request();
+                require_1d(buf_idx, "inlier_indices");
+                std::vector<size_t> idx_vec(buf_idx.shape[0]);
+                const size_t* idx_ptr = static_cast<const size_t*>(buf_idx.ptr);
+                std::copy(idx_ptr, idx_ptr + buf_idx.shape[0], idx_vec.begin());
+
+                // Release the GIL for the heavy C++ computation.
+                py::gil_scoped_release release;
+
+                // Call the refinement function.
+                return refineRadialFundamentalMatrixLM(mat, f, dist_vec, idx_vec);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("C++ exception in refineRadialFundamentalMatrixLM: ") + e.what());
+            } catch (...) {
+                throw std::runtime_error("Unknown exception in refineRadialFundamentalMatrixLM");
+            }
+        },
+        "Refine radial fundamental matrix using LM optimization on inlier points.",
+        py::arg("correspondences"),
+        py::arg("initial_f"),
+        py::arg("initial_distortion"),
+        py::arg("inlier_indices"));
+
+    // Expose refineFocalFundamentalMatrixLM function for focal length refinement
+    m.def(
+        "refineFocalFundamentalMatrixLM",
+        [](py::array_t<double, py::array::c_style> correspondences,
+           py::array_t<double, py::array::c_style> initial_f,
+           py::array_t<double, py::array::c_style> initial_focals,
+           py::array_t<size_t, py::array::c_style> inlier_indices) {
+
+            try {
+                // Get buffer metadata for correspondences.
+                auto buf_corr = correspondences.request();
+                require_2d(buf_corr, "correspondences");
+
+                // Map correspondences without copying into an Eigen row-major matrix view.
+                Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> mat(
+                    static_cast<const double*>(buf_corr.ptr),
+                    static_cast<Eigen::Index>(buf_corr.shape[0]),
+                    static_cast<Eigen::Index>(buf_corr.shape[1]));
+
+                // Extract initial_f as 3x3 matrix
+                auto buf_f = initial_f.request();
+                require_1d(buf_f, "initial_f");
+                if (buf_f.shape[0] != 9)
+                    throw std::invalid_argument("initial_f must have 9 elements (3x3 matrix)");
+
+                Eigen::Matrix3d f;
+                const double* f_ptr = static_cast<const double*>(buf_f.ptr);
+                f << f_ptr[0], f_ptr[1], f_ptr[2],
+                     f_ptr[3], f_ptr[4], f_ptr[5],
+                     f_ptr[6], f_ptr[7], f_ptr[8];
+
+                // Extract initial_focals as [f1, f2]
+                std::vector<double> focal_vec = vec_from_1d_f64(initial_focals, "initial_focals");
+                if (focal_vec.size() != 2)
+                    throw std::invalid_argument("initial_focals must have exactly 2 elements [f1, f2]");
+
+                // Extract inlier_indices as vector of size_t
+                auto buf_idx = inlier_indices.request();
+                require_1d(buf_idx, "inlier_indices");
+                std::vector<size_t> idx_vec(buf_idx.shape[0]);
+                const size_t* idx_ptr = static_cast<const size_t*>(buf_idx.ptr);
+                std::copy(idx_ptr, idx_ptr + buf_idx.shape[0], idx_vec.begin());
+
+                // Release the GIL for the heavy C++ computation.
+                py::gil_scoped_release release;
+
+                // Call the refinement function.
+                return refineFocalFundamentalMatrixLM(mat, f, focal_vec, idx_vec);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("C++ exception in refineFocalFundamentalMatrixLM: ") + e.what());
+            } catch (...) {
+                throw std::runtime_error("Unknown exception in refineFocalFundamentalMatrixLM");
+            }
+        },
+        "Refine focal fundamental matrix using LM optimization on inlier points. "
+        "Estimates F + focal lengths f1, f2 for both cameras. "
+        "Correspondences should be centered at principal point.",
+        py::arg("correspondences"),
+        py::arg("initial_f"),
+        py::arg("initial_focals"),
+        py::arg("inlier_indices"));
+
+    // Expose refineFocalFundamentalMatrixRTLM function for R+t parameterized focal length refinement
+    m.def(
+        "refineFocalFundamentalMatrixRTLM",
+        [](py::array_t<double, py::array::c_style | py::array::forcecast> correspondences,
+           py::array_t<double, py::array::c_style | py::array::forcecast> initial_f,
+           py::array_t<double, py::array::c_style | py::array::forcecast> initial_focals,
+           py::array_t<size_t, py::array::c_style | py::array::forcecast> inlier_indices)
+            -> std::tuple<Eigen::Matrix3d, std::vector<double>, double>
+        {
+            try {
+                // Convert correspondences to DataMatrix.
+                auto buf = correspondences.request();
+                require_2d(buf, "correspondences");
+                DataMatrix mat = Eigen::Map<DataMatrix>(static_cast<double*>(buf.ptr), buf.shape[0], buf.shape[1]);
+
+                // Extract initial_f as 3x3 matrix
+                auto buf_f = initial_f.request();
+                require_2d(buf_f, "initial_f");
+                if (buf_f.shape[0] != 3 || buf_f.shape[1] != 3)
+                    throw std::invalid_argument("initial_f must be a 3x3 matrix");
+                const double* f_ptr = static_cast<const double*>(buf_f.ptr);
+                Eigen::Matrix3d f;
+                f << f_ptr[0], f_ptr[1], f_ptr[2],
+                     f_ptr[3], f_ptr[4], f_ptr[5],
+                     f_ptr[6], f_ptr[7], f_ptr[8];
+
+                // Extract initial_focals as [f1, f2]
+                std::vector<double> focal_vec = vec_from_1d_f64(initial_focals, "initial_focals");
+                if (focal_vec.size() != 2)
+                    throw std::invalid_argument("initial_focals must have exactly 2 elements [f1, f2]");
+
+                // Extract inlier_indices as vector of size_t
+                auto buf_idx = inlier_indices.request();
+                require_1d(buf_idx, "inlier_indices");
+                std::vector<size_t> idx_vec(buf_idx.shape[0]);
+                const size_t* idx_ptr = static_cast<const size_t*>(buf_idx.ptr);
+                std::copy(idx_ptr, idx_ptr + buf_idx.shape[0], idx_vec.begin());
+
+                // Release the GIL for the heavy C++ computation.
+                py::gil_scoped_release release;
+
+                // Call the refinement function.
+                return refineFocalFundamentalMatrixRTLM(mat, f, focal_vec, idx_vec);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("C++ exception in refineFocalFundamentalMatrixRTLM: ") + e.what());
+            } catch (...) {
+                throw std::runtime_error("Unknown exception in refineFocalFundamentalMatrixRTLM");
+            }
+        },
+        "Refine focal fundamental matrix using R+t parameterized LM optimization. "
+        "This ensures F always corresponds to a valid essential matrix. "
+        "Parameters: R (3 DOF) + t (2 DOF on unit sphere) + f1, f2 (2 DOF) = 7 DOF total. "
+        "Correspondences should be centered at principal point.",
+        py::arg("correspondences"),
+        py::arg("initial_f"),
+        py::arg("initial_focals"),
+        py::arg("inlier_indices"));
+
+    // Expose estimateFocalFundamentalMatrix to Python
+    m.def(
+        "estimateFocalFundamentalMatrix",
+        [](py::array_t<double, py::array::c_style> correspondences,
+           py::array_t<double, py::array::c_style> image_sizes,
+           py::object probabilities,
+           superansac::RANSACSettings& config)
+            -> std::tuple<Eigen::Matrix3d, std::vector<double>, std::vector<size_t>, double, size_t>
+        {
+            try {
+                // Get buffer metadata for correspondences (same as standard F)
+                auto buf = correspondences.request();
+                require_2d(buf, "correspondences");
+
+                // Map correspondences without copying into an Eigen row-major matrix view
+                Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> mat(
+                    static_cast<const double*>(buf.ptr),
+                    static_cast<Eigen::Index>(buf.shape[0]),
+                    static_cast<Eigen::Index>(buf.shape[1]));
+
+                // Validate image_sizes has exactly 4 elements
+                const auto img4 = require_1d_fixed_f64<4>(image_sizes, "image_sizes");
+                std::vector<double> img_vec(img4.begin(), img4.end());
+
+                // Convert optional probabilities (same as standard F)
+                std::vector<double> prob_vec = probs_from_optional(probabilities);
+
+                // Release the GIL
+                py::gil_scoped_release release;
+
+                return estimateFocalFundamentalMatrix(mat, prob_vec, img_vec, config);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("C++ exception in estimateFocalFundamentalMatrix: ") + e.what());
+            } catch (...) {
+                throw std::runtime_error("Unknown exception in estimateFocalFundamentalMatrix");
+            }
+        },
+        "Estimate focal fundamental matrix using RANSAC with 7-point + Bougnoux solver. "
+        "Uses R+t parameterized LM for non-minimal refinement (ensures valid essential matrix structure). "
+        "Returns (F, [f1, f2], inliers, score, iterations). "
+        "Correspondences should be centered at principal point.",
+        py::arg("correspondences"),
+        py::arg("image_sizes"),
         py::arg("probabilities") = py::none(),
         py::arg("config") = superansac::RANSACSettings());
 }
