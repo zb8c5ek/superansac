@@ -170,6 +170,88 @@ namespace superansac
 				return sqrt(squaredResidual(point_, descriptor_));
 			}
 
+			// Optimized batch residual computation - extracts model once and uses SIMD hints
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& P = kModel_.getData();
+
+				// Extract pose elements once (3x4 [R|t] matrix)
+				const double r11 = P(0, 0), r12 = P(0, 1), r13 = P(0, 2), tx = P(0, 3);
+				const double r21 = P(1, 0), r22 = P(1, 1), r23 = P(1, 2), ty = P(1, 3);
+				const double r31 = P(2, 0), r32 = P(2, 1), r33 = P(2, 2), tz = P(2, 3);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + i * cols;
+					const double u = row[0], v = row[1];
+					const double x = row[2], y = row[3], z = row[4];
+
+					const double px = r11 * x + r12 * y + r13 * z + tx;
+					const double py = r21 * x + r22 * y + r23 * z + ty;
+					const double pz = r31 * x + r32 * y + r33 * z + tz;
+
+					const double invPz = 1.0 / pz;
+					const double pu = px * invPz;
+					const double pv = py * invPz;
+
+					const double du = pu - u;
+					const double dv = pv - v;
+
+					residuals_[i] = du * du + dv * dv;
+				}
+			}
+
+			// Batch residual with indices
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				const size_t* __restrict kIndices_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& P = kModel_.getData();
+
+				const double r11 = P(0, 0), r12 = P(0, 1), r13 = P(0, 2), tx = P(0, 3);
+				const double r21 = P(1, 0), r22 = P(1, 1), r23 = P(1, 2), ty = P(1, 3);
+				const double r31 = P(2, 0), r32 = P(2, 1), r33 = P(2, 2), tz = P(2, 3);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + kIndices_[i] * cols;
+					const double u = row[0], v = row[1];
+					const double x = row[2], y = row[3], z = row[4];
+
+					const double px = r11 * x + r12 * y + r13 * z + tx;
+					const double py = r21 * x + r22 * y + r23 * z + ty;
+					const double pz = r31 * x + r32 * y + r33 * z + tz;
+
+					const double invPz = 1.0 / pz;
+					const double pu = px * invPz;
+					const double pv = py * invPz;
+
+					const double du = pu - u;
+					const double dv = pv - v;
+
+					residuals_[i] = du * du + dv * dv;
+				}
+			}
+
 			// Enable a quick check to see if the model is valid. This can be a geometric
 			// check or some other verification of the model structure.
 			FORCE_INLINE bool isValidModel(models::Model& model_,

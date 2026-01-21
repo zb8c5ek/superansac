@@ -128,6 +128,9 @@ protected:
     size_t rejectedCount_ = 0;
     double rejectedInlierFracSum_ = 0.0;
 
+    // Residual buffer for batch computation (avoids per-call allocation)
+    mutable std::vector<double> residualBuffer_;
+
     // Reset SPRT state (called from initialize to ensure clean state)
     void resetSPRT() {
         rejectedCount_ = 0;
@@ -271,62 +274,92 @@ public:
         static const Score kEmptyScore;
 
         const int N = kData_.rows();
-        if (N == 0) return Score();
+        if (UNLIKELY(N == 0)) return Score();
 
         // Note: Removed permutation - sequential order is sufficient for SPRT
         if constexpr (kUseRuntimeA) {
-            if (tM_ms <= 0.0) const_cast<MAGSACSPRTScoring*>(this)->microBenchmarkResiduals(kData_, kEstimator_, 128);
+            if (UNLIKELY(tM_ms <= 0.0)) const_cast<MAGSACSPRTScoring*>(this)->microBenchmarkResiduals(kData_, kEstimator_, 128);
         }
 
         const double eps = clampProb(sprt_.epsilon, kMinEpsilon, 1.0 - 1e-6);
         const double del = clampProb(sprt_.delta,   kMinDelta,   kMaxDeltaFrac);
         const double A   = std::max(1.0, sprt_.A);
 
+        // Precompute LR multipliers to avoid division in hot loop
+        const double inlierLRMult = del / eps;
+        const double outlierLRMult = (1.0 - del) / (1.0 - eps);
+        const double kBestScoreValue = kBestScore_.getValue();
+        const double kBestPossibleGain = premultiplier * zeroResidualLoss;
+
         double lambdaLR = 1.0;
         int inlierCount = 0;
         double scoreVal = 0.0;
 
-        auto accumulate_point = [&](int iPos, size_t trueIdx) -> bool {
-            const double sqr =
-                kEstimator_->squaredResidual(kData_.row(static_cast<int>(trueIdx)), kModel_);
+        if (LIKELY(kPotentialInlierSets_ == nullptr)) {
+            // Ensure residual buffer has enough capacity (amortized O(1))
+            if (UNLIKELY(residualBuffer_.size() < static_cast<size_t>(N)))
+                residualBuffer_.resize(N);
 
-            if (sqr < squaredThreshold) {
-                lambdaLR *= (del / eps);
-                if (kStoreInliers_) inliers_.push_back(trueIdx);
-                ++inlierCount;
-                scoreVal += magsacLoss(sqr);
-            } else {
-                lambdaLR *= ((1.0 - del) / (1.0 - eps));
-                scoreVal += lossOutlier;
-            }
+            // Phase 1: Batch compute all residuals at once (enables SIMD vectorization)
+            kEstimator_->squaredResidualBatch(kData_, kModel_, residualBuffer_.data(), N);
 
-            if (lambdaLR > A) {
-                // record partial stats to refine delta
-                const double obsFrac = static_cast<double>(inlierCount) / static_cast<double>(iPos + 1);
-                const_cast<MAGSACSPRTScoring*>(this)->rejectedInlierFracSum_ += obsFrac;
-                const_cast<MAGSACSPRTScoring*>(this)->rejectedCount_ += 1;
-                return false;
-            }
-
-            const int remaining = N - iPos - 1;
-            if (premultiplier * zeroResidualLoss * remaining + scoreVal < kBestScore_.getValue())
-                return false;
-
-            return true;
-        };
-
-        if (kPotentialInlierSets_ == nullptr) {
-            // Sequential iteration (permutation removed for performance)
+            // Phase 2: Score from pre-computed residuals with SPRT and early termination
             for (int i = 0; i < N; ++i) {
-                if (!accumulate_point(i, i))
+                const double sqr = residualBuffer_[i];
+
+                if (LIKELY(sqr < squaredThreshold)) {
+                    lambdaLR *= inlierLRMult;
+                    if (kStoreInliers_) inliers_.push_back(i);
+                    ++inlierCount;
+                    scoreVal += magsacLoss(sqr);
+                } else {
+                    lambdaLR *= outlierLRMult;
+                    scoreVal += lossOutlier;
+                }
+
+                // SPRT rejection check (unlikely - most models are reasonable)
+                if (UNLIKELY(lambdaLR > A)) {
+                    // record partial stats to refine delta
+                    const double obsFrac = static_cast<double>(inlierCount) / static_cast<double>(i + 1);
+                    const_cast<MAGSACSPRTScoring*>(this)->rejectedInlierFracSum_ += obsFrac;
+                    const_cast<MAGSACSPRTScoring*>(this)->rejectedCount_ += 1;
+                    return kEmptyScore;
+                }
+
+                // Early termination: if best possible remaining score can't beat best score
+                const int remaining = N - i - 1;
+                if (UNLIKELY(kBestPossibleGain * remaining + scoreVal < kBestScoreValue))
                     return kEmptyScore;
             }
         } else {
+            // Handle potential inlier sets case
             int tested = 0;
             for (const auto *setPtr : *kPotentialInlierSets_) {
                 for (size_t trueIdx : *setPtr) {
-                    if (!accumulate_point(tested, trueIdx))
+                    const double sqr =
+                        kEstimator_->squaredResidual(kData_.row(static_cast<int>(trueIdx)), kModel_);
+
+                    if (LIKELY(sqr < squaredThreshold)) {
+                        lambdaLR *= inlierLRMult;
+                        if (kStoreInliers_) inliers_.push_back(trueIdx);
+                        ++inlierCount;
+                        scoreVal += magsacLoss(sqr);
+                    } else {
+                        lambdaLR *= outlierLRMult;
+                        scoreVal += lossOutlier;
+                    }
+
+                    if (UNLIKELY(lambdaLR > A)) {
+                        const double obsFrac = static_cast<double>(inlierCount) / static_cast<double>(tested + 1);
+                        const_cast<MAGSACSPRTScoring*>(this)->rejectedInlierFracSum_ += obsFrac;
+                        const_cast<MAGSACSPRTScoring*>(this)->rejectedCount_ += 1;
                         return kEmptyScore;
+                    }
+
+                    const int remaining = N - tested - 1;
+                    if (UNLIKELY(kBestPossibleGain * remaining + scoreVal < kBestScoreValue))
+                        return kEmptyScore;
+
                     ++tested;
                 }
             }
@@ -345,19 +378,35 @@ public:
         const std::vector<size_t> *kIndices_ = nullptr
     ) const override
     {
-        if (kIndices_ == nullptr) {
-            const int N = kData_.rows();
+        if (LIKELY(kIndices_ == nullptr)) {
+            const size_t N = static_cast<size_t>(kData_.rows());
             weights_.resize(N);
-            for (int i = 0; i < N; ++i) {
-                const double sqr = kEstimator_->squaredResidual(kData_.row(i), kModel_);
-                weights_[i] = magsacWeight(sqr);
+
+            // Ensure residual buffer has enough capacity
+            if (UNLIKELY(residualBuffer_.size() < N))
+                residualBuffer_.resize(N);
+
+            // Batch compute all residuals at once
+            kEstimator_->squaredResidualBatch(kData_, kModel_, residualBuffer_.data(), N);
+
+            // Compute weights from pre-computed residuals
+            for (size_t i = 0; i < N; ++i) {
+                weights_[i] = magsacWeight(residualBuffer_[i]);
             }
         } else {
-            const int N = static_cast<int>(kIndices_->size());
+            const size_t N = kIndices_->size();
             weights_.resize(N);
-            for (int i = 0; i < N; ++i) {
-                const double sqr = kEstimator_->squaredResidual(kData_.row(static_cast<int>((*kIndices_)[i])), kModel_);
-                weights_[i] = magsacWeight(sqr);
+
+            // Ensure residual buffer has enough capacity
+            if (UNLIKELY(residualBuffer_.size() < N))
+                residualBuffer_.resize(N);
+
+            // Batch compute residuals for indexed points
+            kEstimator_->squaredResidualBatch(kData_, kModel_, kIndices_->data(), residualBuffer_.data(), N);
+
+            // Compute weights from pre-computed residuals
+            for (size_t i = 0; i < N; ++i) {
+                weights_[i] = magsacWeight(residualBuffer_[i]);
             }
         }
     }

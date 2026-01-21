@@ -161,6 +161,83 @@ namespace superansac
 				return sqrt(squaredResidual(point_, descriptor_));
 			}
 
+			// Optimized batch residual computation - extracts model once and uses SIMD hints
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& T = kModel_.getData();
+
+				// Extract transformation elements once (4x3 matrix in column-major layout)
+				// T transforms [x1,y1,z1] to [x2,y2,z2]: T * [x1,y1,z1,1]^T = [x2,y2,z2]^T
+				const double T00 = T(0, 0), T10 = T(1, 0), T20 = T(2, 0), T30 = T(3, 0);
+				const double T01 = T(0, 1), T11 = T(1, 1), T21 = T(2, 1), T31 = T(3, 1);
+				const double T02 = T(0, 2), T12 = T(1, 2), T22 = T(2, 2), T32 = T(3, 2);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + i * cols;
+					const double x1 = row[0], y1 = row[1], z1 = row[2];
+					const double x2 = row[3], y2 = row[4], z2 = row[5];
+
+					const double t1 = T00 * x1 + T10 * y1 + T20 * z1 + T30;
+					const double t2 = T01 * x1 + T11 * y1 + T21 * z1 + T31;
+					const double t3 = T02 * x1 + T12 * y1 + T22 * z1 + T32;
+
+					const double dx = x2 - t1;
+					const double dy = y2 - t2;
+					const double dz = z2 - t3;
+
+					residuals_[i] = dx * dx + dy * dy + dz * dz;
+				}
+			}
+
+			// Batch residual with indices
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				const size_t* __restrict kIndices_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& T = kModel_.getData();
+
+				const double T00 = T(0, 0), T10 = T(1, 0), T20 = T(2, 0), T30 = T(3, 0);
+				const double T01 = T(0, 1), T11 = T(1, 1), T21 = T(2, 1), T31 = T(3, 1);
+				const double T02 = T(0, 2), T12 = T(1, 2), T22 = T(2, 2), T32 = T(3, 2);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + kIndices_[i] * cols;
+					const double x1 = row[0], y1 = row[1], z1 = row[2];
+					const double x2 = row[3], y2 = row[4], z2 = row[5];
+
+					const double t1 = T00 * x1 + T10 * y1 + T20 * z1 + T30;
+					const double t2 = T01 * x1 + T11 * y1 + T21 * z1 + T31;
+					const double t3 = T02 * x1 + T12 * y1 + T22 * z1 + T32;
+
+					const double dx = x2 - t1;
+					const double dy = y2 - t2;
+					const double dz = z2 - t3;
+
+					residuals_[i] = dx * dx + dy * dy + dz * dz;
+				}
+			}
+
 			// Validate the model by checking the number of inlier with symmetric epipolar distance
 			// instead of Sampson distance. In general, Sampson distance is more accurate but less
 			// robust to degenerate solutions than the symmetric epipolar distance. Therefore,

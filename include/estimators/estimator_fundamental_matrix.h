@@ -217,6 +217,88 @@ namespace superansac
 				return sqrt(squaredResidual(point_, descriptor_));
 			}
 
+			// Optimized batch residual computation - extracts model once and uses SIMD hints
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& E = kModel_.getData();
+
+				// Extract model elements once (avoids repeated matrix access)
+				const double E0_0 = E(0, 0), E0_1 = E(0, 1), E0_2 = E(0, 2);
+				const double E1_0 = E(1, 0), E1_1 = E(1, 1), E1_2 = E(1, 2);
+				const double E2_0 = E(2, 0), E2_1 = E(2, 1), E2_2 = E(2, 2);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + i * cols;
+					const double x1_0 = row[0], x1_1 = row[1];
+					const double x2_0 = row[2], x2_1 = row[3];
+
+					const double Ex1_0 = E0_0 * x1_0 + E0_1 * x1_1 + E0_2;
+					const double Ex1_1 = E1_0 * x1_0 + E1_1 * x1_1 + E1_2;
+					const double Ex1_2 = E2_0 * x1_0 + E2_1 * x1_1 + E2_2;
+
+					const double Ex2_0 = E0_0 * x2_0 + E1_0 * x2_1 + E2_0;
+					const double Ex2_1 = E0_1 * x2_0 + E1_1 * x2_1 + E2_1;
+
+					const double C = x2_0 * Ex1_0 + x2_1 * Ex1_1 + Ex1_2;
+					const double Cx = Ex1_0 * Ex1_0 + Ex1_1 * Ex1_1;
+					const double Cy = Ex2_0 * Ex2_0 + Ex2_1 * Ex2_1;
+
+					residuals_[i] = C * C / (Cx + Cy);
+				}
+			}
+
+			// Batch residual with indices
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				const size_t* __restrict kIndices_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& E = kModel_.getData();
+
+				const double E0_0 = E(0, 0), E0_1 = E(0, 1), E0_2 = E(0, 2);
+				const double E1_0 = E(1, 0), E1_1 = E(1, 1), E1_2 = E(1, 2);
+				const double E2_0 = E(2, 0), E2_1 = E(2, 1), E2_2 = E(2, 2);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + kIndices_[i] * cols;
+					const double x1_0 = row[0], x1_1 = row[1];
+					const double x2_0 = row[2], x2_1 = row[3];
+
+					const double Ex1_0 = E0_0 * x1_0 + E0_1 * x1_1 + E0_2;
+					const double Ex1_1 = E1_0 * x1_0 + E1_1 * x1_1 + E1_2;
+					const double Ex1_2 = E2_0 * x1_0 + E2_1 * x1_1 + E2_2;
+
+					const double Ex2_0 = E0_0 * x2_0 + E1_0 * x2_1 + E2_0;
+					const double Ex2_1 = E0_1 * x2_0 + E1_1 * x2_1 + E2_1;
+
+					const double C = x2_0 * Ex1_0 + x2_1 * Ex1_1 + Ex1_2;
+					const double Cx = Ex1_0 * Ex1_0 + Ex1_1 * Ex1_1;
+					const double Cy = Ex2_0 * Ex2_0 + Ex2_1 * Ex2_1;
+
+					residuals_[i] = C * C / (Cx + Cy);
+				}
+			}
+
 			// Validate the model by checking the number of inlier with symmetric epipolar distance
 			// instead of Sampson distance. In general, Sampson distance is more accurate but less
 			// robust to degenerate solutions than the symmetric epipolar distance. Therefore,

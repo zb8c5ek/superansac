@@ -71,6 +71,9 @@ class MAGSACScoring : public AbstractScoring
         double value0;
         double squaredTruncatedThreshold;
         double weightPremultiplier;
+
+        // Residual buffer for batch computation (avoids per-call allocation)
+        mutable std::vector<double> residualBuffer_;
         
         FORCE_INLINE void updateSPRTParameters(const Score& currentBest, 
             int iterationIndex, 
@@ -420,20 +423,21 @@ class MAGSACScoring : public AbstractScoring
                 const double kBestPossibleGain = premultiplier * zeroResidualLoss;
                 const double kBestScoreValue = kBestScore_.getValue();
 
-                // Iterate through all points, calculate the squaredResiduals and store the points as inliers if needed.
-                #ifdef __GNUC__
-                #pragma GCC ivdep  // Tell compiler iterations are independent for vectorization
-                #endif
+                // Ensure residual buffer has enough capacity (amortized O(1))
+                if (UNLIKELY(residualBuffer_.size() < static_cast<size_t>(kPointNumber)))
+                    residualBuffer_.resize(kPointNumber);
+
+                // Phase 1: Batch compute all residuals at once (enables SIMD vectorization)
+                kEstimator_->squaredResidualBatch(kData_, kModel_, residualBuffer_.data(), kPointNumber);
+
+                // Phase 2: Score from pre-computed residuals with early termination
                 for (int pointIdx = 0; pointIdx < kPointNumber; ++pointIdx)
                 {
-                    // Calculate the point-to-model residual
-                    squaredResidual =
-                        kEstimator_->squaredResidual(kData_.row(pointIdx),
-                            kModel_);
+                    squaredResidual = residualBuffer_[pointIdx];
 
                     // If the residual is smaller than the threshold, store it as an inlier and
                     // increase the score.
-                    if (squaredResidual < squaredThreshold)
+                    if (LIKELY(squaredResidual < squaredThreshold))
                     {
                         if (kStoreInliers_) // Store the point as an inlier if needed.
                             inliers_.emplace_back(pointIdx);
@@ -458,7 +462,7 @@ class MAGSACScoring : public AbstractScoring
                         scoreValue += lossOutlier;
 
                     // Early exit AFTER processing: if remaining perfect inliers can't beat best score
-                    if (kBestPossibleGain * (kPointNumber - pointIdx - 1) + scoreValue < kBestScoreValue)
+                    if (UNLIKELY(kBestPossibleGain * (kPointNumber - pointIdx - 1) + scoreValue < kBestScoreValue))
                         return kEmptyScore;
                 }
             }
@@ -475,35 +479,32 @@ class MAGSACScoring : public AbstractScoring
             const std::vector<size_t> *kIndices_ = nullptr) const  // The indices of the points
         {
             double residualPerTwoTimesSquaredSigmaMax,
-                upperIncompleteGamma;
+                upperIncompleteGammaVal;
 
             if (kIndices_ == nullptr)
             {
                 // The number of points
                 const int kPointNumber = kData_.rows();
-                // The squared residual
-                double squaredResidual;
                 // Allocate memory for the weights
                 weights_.resize(kPointNumber);
 
-                // Iterate through all points, calculate the squaredResiduals and store the points as inliers if needed.
+                // Ensure residual buffer has enough capacity
+                if (UNLIKELY(residualBuffer_.size() < static_cast<size_t>(kPointNumber)))
+                    residualBuffer_.resize(kPointNumber);
+
+                // Batch compute all residuals
+                kEstimator_->squaredResidualBatch(kData_, kModel_, residualBuffer_.data(), kPointNumber);
+
+                // Compute weights from residuals
                 for (int pointIdx = 0; pointIdx < kPointNumber; ++pointIdx)
                 {
-                    // Calculate the point-to-model residual
-                    squaredResidual =
-                        kEstimator_->squaredResidual(kData_.row(pointIdx),
-                            kModel_);
-                            
-                    // If the residual is smaller than the threshold, store it as an inlier and
-                    // increase the score.
-                    if (squaredResidual < squaredThreshold)
+                    const double squaredResidual = residualBuffer_[pointIdx];
+
+                    if (LIKELY(squaredResidual < squaredThreshold))
                     {
                         residualPerTwoTimesSquaredSigmaMax = squaredResidual * invTwoTimesSquaredSigmaMax;
-                        upperIncompleteGamma = getUpperGammaValue(residualPerTwoTimesSquaredSigmaMax);
-
-                        weights_[pointIdx] = weightPremultiplier * (upperIncompleteGamma - value0);
-                        // Commenting "weightPremultiplier" as it does not affect the final result. It is just a constant.
-                        //weights_[pointIdx] = upperIncompleteGamma - value0;
+                        upperIncompleteGammaVal = getUpperGammaValue(residualPerTwoTimesSquaredSigmaMax);
+                        weights_[pointIdx] = weightPremultiplier * (upperIncompleteGammaVal - value0);
                     } else
                         weights_[pointIdx] = 0.0;
                 }
@@ -512,28 +513,26 @@ class MAGSACScoring : public AbstractScoring
             {
                 // The number of points
                 const int kPointNumber = kIndices_->size();
-                // The squared residual
-                double squaredResidual;
                 // Allocate memory for the weights
                 weights_.resize(kPointNumber);
 
-                // Iterate through all points, calculate the squaredResiduals and store the points as inliers if needed.
+                // Ensure residual buffer has enough capacity
+                if (UNLIKELY(residualBuffer_.size() < static_cast<size_t>(kPointNumber)))
+                    residualBuffer_.resize(kPointNumber);
+
+                // Batch compute residuals with indices
+                kEstimator_->squaredResidualBatch(kData_, kModel_, kIndices_->data(), residualBuffer_.data(), kPointNumber);
+
+                // Compute weights from residuals
                 for (int pointIdx = 0; pointIdx < kPointNumber; ++pointIdx)
                 {
-                    // Calculate the point-to-model residual
-                    squaredResidual =
-                        kEstimator_->squaredResidual(kData_.row((*kIndices_)[pointIdx]),
-                            kModel_);
-                            
-                    // If the residual is smaller than the threshold, store it as an inlier and
-                    // increase the score.
-                    if (squaredResidual < squaredThreshold)
+                    const double squaredResidual = residualBuffer_[pointIdx];
+
+                    if (LIKELY(squaredResidual < squaredThreshold))
                     {
                         residualPerTwoTimesSquaredSigmaMax = squaredResidual * invTwoTimesSquaredSigmaMax;
-                        upperIncompleteGamma = getUpperGammaValue(residualPerTwoTimesSquaredSigmaMax);
-                        weights_[pointIdx] = weightPremultiplier * (upperIncompleteGamma - value0);
-                        // Commenting "weightPremultiplier" as it does not affect the final result. It is just a constant.
-                        //weights_[pointIdx] = upperIncompleteGamma - value0;
+                        upperIncompleteGammaVal = getUpperGammaValue(residualPerTwoTimesSquaredSigmaMax);
+                        weights_[pointIdx] = weightPremultiplier * (upperIncompleteGammaVal - value0);
                     } else
                         weights_[pointIdx] = 0.0;
                 }

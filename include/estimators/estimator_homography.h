@@ -200,6 +200,82 @@ namespace superansac
 				return sqrt(squaredResidual(point_, descriptor_));
 			}
 
+			// Optimized batch residual computation - extracts model once and uses SIMD hints
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& H = kModel_.getData();
+
+				// Extract model elements once
+				const double H00 = H(0, 0), H01 = H(0, 1), H02 = H(0, 2);
+				const double H10 = H(1, 0), H11 = H(1, 1), H12 = H(1, 2);
+				const double H20 = H(2, 0), H21 = H(2, 1), H22 = H(2, 2);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + i * cols;
+					const double x1 = row[0], y1 = row[1];
+					const double x2 = row[2], y2 = row[3];
+
+					const double t3 = H20 * x1 + H21 * y1 + H22;
+					const double invT3 = 1.0 / t3;
+					const double t1 = (H00 * x1 + H01 * y1 + H02) * invT3;
+					const double t2 = (H10 * x1 + H11 * y1 + H12) * invT3;
+
+					const double d1 = x2 - t1;
+					const double d2 = y2 - t2;
+
+					residuals_[i] = d1 * d1 + d2 * d2;
+				}
+			}
+
+			// Batch residual with indices
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				const size_t* __restrict kIndices_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& H = kModel_.getData();
+
+				const double H00 = H(0, 0), H01 = H(0, 1), H02 = H(0, 2);
+				const double H10 = H(1, 0), H11 = H(1, 1), H12 = H(1, 2);
+				const double H20 = H(2, 0), H21 = H(2, 1), H22 = H(2, 2);
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + kIndices_[i] * cols;
+					const double x1 = row[0], y1 = row[1];
+					const double x2 = row[2], y2 = row[3];
+
+					const double t3 = H20 * x1 + H21 * y1 + H22;
+					const double invT3 = 1.0 / t3;
+					const double t1 = (H00 * x1 + H01 * y1 + H02) * invT3;
+					const double t2 = (H10 * x1 + H11 * y1 + H12) * invT3;
+
+					const double d1 = x2 - t1;
+					const double d2 = y2 - t2;
+
+					residuals_[i] = d1 * d1 + d2 * d2;
+				}
+			}
+
 			FORCE_INLINE bool normalizePoints(
 				const DataMatrix& kData_, // The data points
 				const size_t *kSample_, // The points to which the model will be fit

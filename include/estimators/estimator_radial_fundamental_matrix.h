@@ -156,6 +156,116 @@ namespace superansac
 				return std::sqrt(squaredResidual(point_, descriptor_));
 			}
 
+			// Optimized batch residual computation
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& D = kModel_.getData();
+
+				// Extract F and lambda values once
+				const double F00 = D(0, 0), F01 = D(0, 1), F02 = D(0, 2);
+				const double F10 = D(1, 0), F11 = D(1, 1), F12 = D(1, 2);
+				const double F20 = D(2, 0), F21 = D(2, 1), F22 = D(2, 2);
+				const double lam1 = D(0, 3);
+				const double lam2 = D(1, 3);
+				constexpr double eps = 1e-12;
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + i * cols;
+					const double x1_u = row[0], x1_v = row[1];
+					const double x2_u = row[2], x2_v = row[3];
+
+					// Distorted homogeneous coordinates
+					const double r1_sq = x1_u * x1_u + x1_v * x1_v;
+					const double r2_sq = x2_u * x2_u + x2_v * x2_v;
+					const double x1_w = 1.0 + lam1 * r1_sq;
+					const double x2_w = 1.0 + lam2 * r2_sq;
+
+					// F * x1
+					const double Fx1_0 = F00 * x1_u + F01 * x1_v + F02 * x1_w;
+					const double Fx1_1 = F10 * x1_u + F11 * x1_v + F12 * x1_w;
+					const double Fx1_2 = F20 * x1_u + F21 * x1_v + F22 * x1_w;
+
+					// F^T * x2
+					const double Ftx2_0 = F00 * x2_u + F10 * x2_v + F20 * x2_w;
+					const double Ftx2_1 = F01 * x2_u + F11 * x2_v + F21 * x2_w;
+					const double Ftx2_2 = F02 * x2_u + F12 * x2_v + F22 * x2_w;
+
+					// x2^T * F * x1
+					const double num = x2_u * Fx1_0 + x2_v * Fx1_1 + x2_w * Fx1_2;
+					const double num_sq = num * num;
+
+					const double den = Fx1_0 * Fx1_0 + Fx1_1 * Fx1_1 +
+									   Ftx2_0 * Ftx2_0 + Ftx2_1 * Ftx2_1 + eps;
+
+					const double result = num_sq / den;
+					residuals_[i] = std::isfinite(result) ? result : 1e10;
+				}
+			}
+
+			// Batch residual with indices
+			FORCE_INLINE void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				const size_t* __restrict kIndices_,
+				double* __restrict residuals_,
+				const size_t kCount_) const override
+			{
+				const Eigen::MatrixXd& D = kModel_.getData();
+
+				const double F00 = D(0, 0), F01 = D(0, 1), F02 = D(0, 2);
+				const double F10 = D(1, 0), F11 = D(1, 1), F12 = D(1, 2);
+				const double F20 = D(2, 0), F21 = D(2, 1), F22 = D(2, 2);
+				const double lam1 = D(0, 3);
+				const double lam2 = D(1, 3);
+				constexpr double eps = 1e-12;
+
+				const double* __restrict dataPtr = kData_.data();
+				const Eigen::Index cols = kData_.cols();
+
+				#ifdef __GNUC__
+				#pragma GCC ivdep
+				#endif
+				for (size_t i = 0; i < kCount_; ++i)
+				{
+					const double* __restrict row = dataPtr + kIndices_[i] * cols;
+					const double x1_u = row[0], x1_v = row[1];
+					const double x2_u = row[2], x2_v = row[3];
+
+					const double r1_sq = x1_u * x1_u + x1_v * x1_v;
+					const double r2_sq = x2_u * x2_u + x2_v * x2_v;
+					const double x1_w = 1.0 + lam1 * r1_sq;
+					const double x2_w = 1.0 + lam2 * r2_sq;
+
+					const double Fx1_0 = F00 * x1_u + F01 * x1_v + F02 * x1_w;
+					const double Fx1_1 = F10 * x1_u + F11 * x1_v + F12 * x1_w;
+					const double Fx1_2 = F20 * x1_u + F21 * x1_v + F22 * x1_w;
+
+					const double Ftx2_0 = F00 * x2_u + F10 * x2_v + F20 * x2_w;
+					const double Ftx2_1 = F01 * x2_u + F11 * x2_v + F21 * x2_w;
+					const double Ftx2_2 = F02 * x2_u + F12 * x2_v + F22 * x2_w;
+
+					const double num = x2_u * Fx1_0 + x2_v * Fx1_1 + x2_w * Fx1_2;
+					const double num_sq = num * num;
+
+					const double den = Fx1_0 * Fx1_0 + Fx1_1 * Fx1_1 +
+									   Ftx2_0 * Ftx2_0 + Ftx2_1 * Ftx2_1 + eps;
+
+					const double result = num_sq / den;
+					residuals_[i] = std::isfinite(result) ? result : 1e10;
+				}
+			}
+
 			FORCE_INLINE bool isValidModel(
 				models::Model& model_,
 				const DataMatrix& kData_,

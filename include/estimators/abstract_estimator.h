@@ -154,7 +154,32 @@ namespace superansac
 			// this function appropriately for the task being solved.
 			FORCE_INLINE virtual double residual(const DataMatrix& kData_, const models::Model& kModel_) const = 0;
 			FORCE_INLINE virtual double squaredResidual(const DataMatrix& kData_, const models::Model& kModel_) const = 0;
-			
+
+			// Batch residual computation - process all points at once for better performance
+			// Default implementation falls back to per-point computation; estimators can override
+			// with optimized implementations that extract model elements once and use SIMD hints
+			FORCE_INLINE virtual void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				double* residuals_,
+				const size_t kCount_) const
+			{
+				for (size_t i = 0; i < kCount_; ++i)
+					residuals_[i] = squaredResidual(kData_.row(static_cast<int>(i)), kModel_);
+			}
+
+			// Batch residual computation with indices - for scoring subset of points
+			FORCE_INLINE virtual void squaredResidualBatch(
+				const DataMatrix& kData_,
+				const models::Model& kModel_,
+				const size_t* kIndices_,
+				double* residuals_,
+				const size_t kCount_) const
+			{
+				for (size_t i = 0; i < kCount_; ++i)
+					residuals_[i] = squaredResidual(kData_.row(static_cast<int>(kIndices_[i])), kModel_);
+			}
+
 			// A function to decide if the selected sample is degenerate or not
 			// before calculating the model parameters
 			FORCE_INLINE virtual bool isValidSample(
