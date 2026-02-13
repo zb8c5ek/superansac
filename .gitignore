@@ -44,3 +44,4 @@ pyproject.toml
 *.csv
 *.pdf
 tests/*.csv
+/_build

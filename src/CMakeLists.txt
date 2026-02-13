@@ -28,6 +28,18 @@ set_target_properties(SupeRANSAC PROPERTIES
   VISIBILITY_INLINES_HIDDEN NO
 )
 
+# On MSVC, /GL produces LTCG "anonymous" .obj files that dumpbin cannot parse,
+# which breaks WINDOWS_EXPORT_ALL_SYMBOLS (cmake -E __create_def yields an empty
+# .def). Disable IPO/GL specifically for this shared-library target so that the
+# auto-export mechanism works. The pybind module (which links this .lib) can
+# still use LTO via the global setting.
+if(MSVC)
+  set_property(TARGET SupeRANSAC PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
+  set_property(TARGET SupeRANSAC PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+  # Strip /GL from this target's compile options (it was added globally)
+  target_compile_options(SupeRANSAC PRIVATE $<$<CONFIG:Release>:/GL->)
+endif()
+
 # Public includes
 target_include_directories(SupeRANSAC PUBLIC
   ${PROJECT_SOURCE_DIR}/include

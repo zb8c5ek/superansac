@@ -5,7 +5,11 @@
 #include <random>
 #include <algorithm>
 #include <vector>
-#include <unordered_set> 
+#include <unordered_set>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #include "macros.h"
 
@@ -43,15 +47,27 @@ struct Xoshiro256ss {
 };
 
 // -------- Lemire mapping to [0, n) (closed -> adjust) --------
+// 128-bit multiply helper: returns {high, low} of a * b
+struct u128 { uint64_t hi; uint64_t lo; };
+inline u128 mul128(uint64_t a, uint64_t b) {
+#if defined(_MSC_VER)
+    uint64_t hi;
+    uint64_t lo = _umul128(a, b, &hi);
+    return {hi, lo};
+#elif defined(__GNUC__) || defined(__clang__)
+    __uint128_t m = (__uint128_t)a * (__uint128_t)b;
+    return {(uint64_t)(m >> 64), (uint64_t)m};
+#endif
+}
+
 inline uint64_t uniform_u64_closed(Xoshiro256ss& rng, uint64_t lo, uint64_t hi) {
     const uint64_t n = hi - lo + 1;
-    __uint128_t m = (__uint128_t)rng() * (__uint128_t)n;
-    uint64_t l = (uint64_t)m;
-    if (l < n) {
-        const uint64_t t = -n % n;
-        while (l < t) { m = (__uint128_t)rng() * (__uint128_t)n; l = (uint64_t)m; }
+    u128 m = mul128(rng(), n);
+    if (m.lo < n) {
+        const uint64_t t = (0u - n) % n;  // portable unsigned negation
+        while (m.lo < t) { m = mul128(rng(), n); }
     }
-    return (uint64_t)(m >> 64) + lo;
+    return m.hi + lo;
 }
 
 template <typename T>

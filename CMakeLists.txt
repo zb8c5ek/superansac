@@ -9,6 +9,13 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# MSVC needs _USE_MATH_DEFINES for M_PI in <cmath>
+# MSVC needs WINDOWS_EXPORT_ALL_SYMBOLS to generate .lib import libraries for DLLs
+if(MSVC)
+  add_compile_definitions(_USE_MATH_DEFINES)
+  set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
+
 # ---- Optional fast-math (OFF by default) ----
 option(SUPERANSAC_ENABLE_FAST_MATH "Enable aggressive fast-math" ON)
 
@@ -55,7 +62,15 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   add_flag_if_supported(-finline-functions)
   add_compile_options($<$<CONFIG:Release>:-DNDEBUG>)
 elseif(MSVC)
-  add_compile_options($<$<CONFIG:Release>:/O2 /Oi /GL /Gy /DNDEBUG /MP /Zc:inline>)
+  add_compile_options(
+    $<$<CONFIG:Release>:/O2>
+    $<$<CONFIG:Release>:/Oi>
+    $<$<CONFIG:Release>:/GL>
+    $<$<CONFIG:Release>:/Gy>
+    $<$<CONFIG:Release>:/DNDEBUG>
+    $<$<CONFIG:Release>:/MP>
+    $<$<CONFIG:Release>:/Zc:inline>
+  )
   add_link_options($<$<CONFIG:Release>:/LTCG>)
 endif()
 

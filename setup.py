@@ -4,6 +4,8 @@ import sys
 import setuptools
 import subprocess
 import os
+import shutil
+import glob as _glob
 
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir=''):
@@ -19,6 +21,7 @@ class CMakeBuild(build_ext):
     def build_extension(self, ext):
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
         cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir,
+                      '-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=' + extdir,
                       '-DPYTHON_EXECUTABLE=' + sys.executable]
 
         cfg = 'Debug' if self.debug else 'Release'
@@ -31,7 +34,26 @@ class CMakeBuild(build_ext):
             os.makedirs(self.build_temp)
 
         subprocess.check_call(['cmake', ext.sourcedir] + cmake_args, cwd=self.build_temp)
-        subprocess.check_call(['cmake', '--build', '.', '--config', cfg, '--', f'-j{num_cores}'], cwd=self.build_temp)  # Adjusted line
+        build_cmd = ['cmake', '--build', '.', '--config', cfg]
+        if sys.platform == 'win32':
+            build_cmd += ['--', f'/m:{num_cores}']  # MSVC parallel build
+        else:
+            build_cmd += ['--', f'-j{num_cores}']  # Make/Ninja parallel build
+        subprocess.check_call(build_cmd, cwd=self.build_temp)
+
+        # For editable installs: copy built .pyd/.so and .dll/.so to the source
+        # root so the setuptools editable finder can locate them.
+        srcdir = ext.sourcedir
+        for pattern in ['*.pyd', '*.so', '*.dll']:
+            # MSVC multi-config puts outputs under extdir/Release/
+            for f in _glob.glob(os.path.join(extdir, cfg, pattern)):
+                dst = os.path.join(srcdir, os.path.basename(f))
+                if os.path.abspath(f) != os.path.abspath(dst):
+                    shutil.copy2(f, dst)
+            for f in _glob.glob(os.path.join(extdir, pattern)):
+                dst = os.path.join(srcdir, os.path.basename(f))
+                if os.path.abspath(f) != os.path.abspath(dst):
+                    shutil.copy2(f, dst)
 
 setup(
     name='pysuperansac',
@@ -41,7 +63,7 @@ setup(
     description='A RANSAC implementation for robust estimation.',
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    ext_modules=[CMakeExtension('SupeRANSAC', sourcedir='.')],
+    ext_modules=[CMakeExtension('pysuperansac', sourcedir='.')],
     cmdclass=dict(build_ext=CMakeBuild),
     url="https://github.com/you/superansac",
     zip_safe=False,
